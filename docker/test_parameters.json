@@ -1,0 +1,35 @@
+{
+    "commands": [
+        "/run.sh"
+    ],
+    "environment": [
+        {
+            "name": "VERBOSE",
+            "value": "2"
+        }
+    ],
+    "inputs": [
+        {
+            "bucket_id": "___SCRATCH_BUCKET___",
+            "bucket_key": "input-file-1",
+            "file": "/root/input1.txt"
+        },
+        {
+            "bucket_id": "___SCRATCH_BUCKET___",
+            "bucket_key": "input-file-2",
+            "file": "/root/input2.txt"
+        }
+    ],
+    "outputs": [
+        {
+            "bucket_id": "___CIRRUS_SCAN_RESULTS_BUCKET___",
+            "bucket_key": "output-file-1",
+            "file": "/root/output1.txt"
+        },
+        {
+            "bucket_id": "___CIRRUS_SCAN_RESULTS_BUCKET___",
+            "bucket_key": "output-file-2",
+            "file": "/root/output2.txt"
+        }
+    ]
+}

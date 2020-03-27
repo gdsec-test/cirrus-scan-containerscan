@@ -46,6 +46,13 @@ following parameters:
         specifies the S3 bucket and object that should be updated with the task
         status upon completion
 
+    parameters (optional)
+        specifies additional data that may be useful to the task. If this is
+        present and contains the key "arg", the value of that key will be
+        written to the file "CIRRUSSCAN_ARG" before commands are executed.
+        (If "arg" is not present, the file will not be created.) This dictionary
+        can be retrieved by calling wrapper.get_parameters().
+
 Example:
 
 {
@@ -58,6 +65,10 @@ Example:
             "value": "1"
         }
     ],
+    "parameters": {
+        "arg": "1.2.3.0/24",
+        "severity": 50
+    },
     "inputs": [],
     "outputs": [
         {
@@ -88,6 +99,10 @@ logging_handler.setFormatter(logging_formatter)
 log.addHandler(logging_handler)
 
 STATUS_FILE = "CIRRUSSCAN_STATUS"
+ARGUMENT_FILE = "CIRRUSSCAN_ARG"
+PARAMETER_FILE = "CIRRUSSCAN_PARAMETERS"
+
+variable_parameters = None
 
 
 def put_status(status_dict):
@@ -112,6 +127,51 @@ def get_status():
     except:
         log.error("Unable to retrieve status data from %s", STATUS_FILE)
         return {}
+
+
+def get_parameters(default={}):
+    """Retrieve variable parameters (dictionary) from task request"""
+
+    global variable_parameters
+
+    # Transparently reload from state file if we haven't done so yet
+    if variable_parameters is None:
+        try:
+            with open(PARAMETER_FILE, "r") as f:
+                variable_parameters = json.load(f)
+        except:
+            log.error("No file %s to re-read", PARAMETER_FILE)
+
+    if variable_parameters is None:
+        return default
+    return variable_parameters
+
+
+def resolve_parameter(raw_value, default_value=None):
+    """Retrieve remote parameter values"""
+
+    # If the input parameter does NOT begin with "s3://", return it
+    # unchanged. Otherwise, we assume this is a S3 reference and
+    # retrieve the specified object, returning it (unmodified). If
+    # we encounter a problem retrieving the object, return the
+    # default value.
+
+    try:
+        if raw_value.startswith("s3://"):
+            # S3 reference, s3://bucket/key
+            _, _, s3_bucket, s3_key = raw_value.split("/", 3)
+            log.debug("Retrieving S3 content from %s / %s", s3_bucket, s3_key)
+            s3 = boto3.client("s3")
+            info = s3.get_object(Bucket=s3_bucket, Key=s3_key)
+            streamer = info["Body"]
+            return streamer.read().decode("utf-8")
+
+        # Default... Unrecognized must be literal data
+        return raw_value
+
+    except Exception as e:
+        log.exception("Exception retrieving content:")
+        return default_value
 
 
 def main():
@@ -161,6 +221,29 @@ def main():
                     os.environ[env_entry["name"]] = env_entry["value"]
     except Exception as e:
         log.exception("Unable to set environment variables")
+
+    # Save variable parameters. We need to put them into a file also,
+    # so we can read them back later if we get a callback (in a new
+    # process) to access it. Automatically attempt to resolve the arg
+    # parameter before writing so we can execute clueless external
+    # programs transparently.
+
+    global variable_parameters
+    try:
+        if "parameters" in params_dict:
+            variable_parameters = params_dict["parameters"]
+            if "arg" in variable_parameters:
+                log.debug(
+                    "Creating %s with '%s'", ARGUMENT_FILE, variable_parameters["arg"]
+                )
+                explode = resolve_parameter(variable_parameters["arg"], "")
+                variable_parameters["arg"] = explode
+                with open(ARGUMENT_FILE, "w") as f:
+                    f.write(explode)
+            with open(PARAMETER_FILE, "w") as f:
+                json.dump(variable_parameters, f)
+    except Exception as e:
+        log.exception("Unable to process variable parameters")
 
     # Copy input files
 

@@ -626,7 +626,7 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         if finding_id in self._cache:
             log.debug("Found %s in cache", finding_id)
             return copy.deepcopy(self._cache[finding_id])
-        if self._in_transaction:
+        if self._in_transaction and finding_id.startswith(self._prefix):
             log.debug("No %s in cache", finding_id)
             return None
         log.debug("No %s in cache, trying single load", finding_id)

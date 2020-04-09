@@ -3,7 +3,7 @@
 ### Build container
 
 ```
-sudo docker build -t template .
+sudo docker build --pull -t template .
 
 ```
 

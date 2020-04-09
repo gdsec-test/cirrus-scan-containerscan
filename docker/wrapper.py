@@ -84,6 +84,7 @@ Example:
 import json
 import logging
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -105,11 +106,23 @@ PARAMETER_FILE = "CIRRUSSCAN_PARAMETERS"
 variable_parameters = None
 
 
-def put_status(status_dict):
+def put_status(status_dict, overwrite=False):
     """Save supplied status (dictionary) into an exchange file"""
 
+    p = pathlib.Path(STATUS_FILE)
+
+    # Construct a list on the fly, so that multiple calls append rather
+    # than overwrite each other, unless we mean to do that.
+    if overwrite or not p.exists():
+        marker = "["
+        mode = "w"
+    else:
+        marker = ","
+        mode = "a"
+
     try:
-        with open(STATUS_FILE, "w") as f:
+        with p.open(mode) as f:
+            f.write(marker)
             json.dump(status_dict, f)
         log.debug("Transferred status data to %s", STATUS_FILE)
     except:
@@ -119,14 +132,62 @@ def put_status(status_dict):
 def get_status():
     """Retrieve status (dictionary) from an exchange file"""
 
+    p = pathlib.Path(STATUS_FILE)
     try:
-        with open(STATUS_FILE, "r") as f:
-            status_dict = json.load(f)
-        log.debug("Transferred status data from %s", STATUS_FILE)
-        return status_dict
+        # We need to terminate the list to make it valid before reading
+        with p.open("a") as f:
+            f.write("]")
+
+        # Retrieve the entire list (or die if we have missing/malformed data)
+        with p.open("r") as f:
+            status_list = json.load(f)
+        log.debug("Transferred %i status blocks from %s", len(status_list), STATUS_FILE)
     except:
-        log.error("Unable to retrieve status data from %s", STATUS_FILE)
+        log.exception("Unable to retrieve status data from %s", STATUS_FILE)
         return {}
+
+    # Return data. It's easy if there's only one entry...
+    status_dict = status_list[0]
+    status_dict["requested_count"] = len(status_list)
+    if len(status_list) == 1:
+        return status_dict
+
+    # Merge all additional entries into the first one (bleeeech)
+    for more_status in status_list[1:]:
+        merge_status(status_dict, more_status)
+    return status_dict
+
+
+def merge_status(target_dict, other_dict):
+    """Combine two status entries into one"""
+
+    # This logic is simplistic and assumes that if there is a key
+    # collision, both dictionaries have compatible values. It only
+    # handles types we've historically used in status reports.
+    for k, v in other_dict.items():
+        if k not in target_dict:
+            # If no collision, it's easy
+            target_dict[k] = v
+        elif isinstance(v, dict):
+            # Consolidate dicts recursively
+            merge_status(target_dict[k], other_dict[k])
+        elif isinstance(v, int):
+            # Sum integers
+            target_dict[k] += v
+        elif isinstance(v, str) and v.isdecimal():
+            # Sum string representations of integers
+            target_dict[k] = str(int(target_dict[k]) + int(v))
+        elif k == "status":
+            if target_dict[k].find(v) == -1:
+                # Aggregate unique status values
+                target_dict[k] += "+%s" % v
+        elif k == "compliance":
+            if v == "FAIL":
+                # compliance is FAIL if any entry has FAIL
+                target_dict[k] = v
+        else:
+            # We have no idea what to do
+            target_dict[k] = "(multiple)"
 
 
 def get_parameters(default={}):
@@ -136,8 +197,9 @@ def get_parameters(default={}):
 
     # Transparently reload from state file if we haven't done so yet
     if variable_parameters is None:
+        p = pathlib.Path(PARAMETER_FILE)
         try:
-            with open(PARAMETER_FILE, "r") as f:
+            with p.open("r") as f:
                 variable_parameters = json.load(f)
         except:
             log.error("No file %s to re-read", PARAMETER_FILE)
@@ -193,34 +255,34 @@ def main():
     log.info("BUCKET_ID: %s", bucket_id)
     log.info("OBJECT_ID: %s", object_id)
 
-    # Attempt to parse the parameters contained in the specified bucket
+    # Attempt to parse the parameters contained in the specified bucket.
+    # It makes absolutely no sense to try and catch exceptions here, because
+    # if the data is not retrievable or is malformed, we can't figure out
+    # what to do -- this is a fatal condition. Therefore don't work hard to
+    # abort when python can just do it for us.
 
-    try:
-        params_str = (
-            s3.get_object(Bucket=bucket_id, Key=object_id)["Body"]
-            .read()
-            .decode("UTF-8")
-        )
-        log.debug("Parameters (original):\n%s", params_str)
-        params_dict = json.loads(params_str)
-        log.debug("Parameters (parsed): %s", json.dumps(params_dict))
-    except Exception as e:
-        log.exception("Unable to parse parameter JSON")
+    params_str = (
+        s3.get_object(Bucket=bucket_id, Key=object_id)["Body"].read().decode("UTF-8")
+    )
+    log.debug("Parameters (original):\n%s", params_str)
+    params_dict = json.loads(params_str)
+    log.debug("Parameters (parsed): %s", json.dumps(params_dict))
 
     # Set environment variables
 
-    try:
-        if "environment" in params_dict:
-            for env_entry in params_dict["environment"]:
-                if "name" in env_entry and "value" in env_entry:
-                    log.debug(
-                        "Setting environment variable [%s] = [%s]",
-                        env_entry["name"],
-                        env_entry["value"],
-                    )
-                    os.environ[env_entry["name"]] = env_entry["value"]
-    except Exception as e:
-        log.exception("Unable to set environment variables")
+    if "environment" in params_dict and isinstance(params_dict["environment"], list):
+        for env_entry in params_dict["environment"]:
+            if (
+                isinstance(env_entry, dict)
+                and "name" in env_entry
+                and "value" in env_entry
+            ):
+                log.debug(
+                    "Setting environment variable [%s] = [%s]",
+                    env_entry["name"],
+                    env_entry["value"],
+                )
+                os.environ[env_entry["name"]] = env_entry["value"]
 
     # Save variable parameters. We need to put them into a file also,
     # so we can read them back later if we get a callback (in a new
@@ -238,9 +300,11 @@ def main():
                 )
                 explode = resolve_parameter(variable_parameters["arg"], "")
                 variable_parameters["arg"] = explode
-                with open(ARGUMENT_FILE, "w") as f:
+                p_arg = pathlib.Path(ARGUMENT_FILE)
+                with p_arg.open("w") as f:
                     f.write(explode)
-            with open(PARAMETER_FILE, "w") as f:
+            p_par = pathlib.Path(PARAMETER_FILE)
+            with p_par.open("w") as f:
                 json.dump(variable_parameters, f)
     except Exception as e:
         log.exception("Unable to process variable parameters")

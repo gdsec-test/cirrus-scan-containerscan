@@ -228,6 +228,22 @@ def resolve_parameter(raw_value, default_value=None):
             streamer = info["Body"]
             return streamer.read().decode("utf-8")
 
+        elif raw_value.startswith("ssm://"):
+            # Parameter Store reference, ssm:///some/parameter/name
+            _, _, parameter_name = raw_value.split("/", 2)
+            log.debug("Retrieving SSM content from %s", parameter_name)
+            ssm = boto3.client("ssm")
+            info = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return info["Parameter"]["Value"]
+
+        elif raw_value.startswith("file://"):
+            # Local file, file:///some/file
+            _, _, local_file = raw_value.split("/", 2)
+            log.debug("Retrieving local content from %s", local_file)
+            p = pathlib.Path(local_file)
+            with p.open("r") as f:
+                return f.read()
+
         # Default... Unrecognized must be literal data
         return raw_value
 

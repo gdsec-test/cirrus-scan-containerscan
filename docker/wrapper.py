@@ -85,6 +85,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -104,6 +105,8 @@ ARGUMENT_FILE = "CIRRUSSCAN_ARG"
 PARAMETER_FILE = "CIRRUSSCAN_PARAMETERS"
 
 variable_parameters = None
+include_filter = None
+exclude_filter = None
 
 
 def put_status(status_dict, overwrite=False):
@@ -250,6 +253,49 @@ def resolve_parameter(raw_value, default_value=None):
     except Exception as e:
         log.exception("Exception retrieving content:")
         return default_value
+
+
+def is_in_scope(name):
+    """Determine if the supplied identifier name should be scanned"""
+
+    global include_filter
+    global exclude_filter
+
+    # This potentially could be called a number of times, so let's do the
+    # setup only on the first call.
+    if include_filter is None:
+        params = get_parameters()
+        # A word about defaults... By default, everything is in scope. In terms
+        # used by the rest of this function, that means we want to include
+        # everything and exclude nothing, unless the caller says otherwise.
+
+        # Although we can construct regexs that match everything and nothing,
+        # we only need a boolean result; therefore it is more efficient to
+        # use lambda functions for the common case that defaults are needed.
+
+        # When the user supplies an expression, the filter function will be a
+        # re.search method that returns a match object ("true") or None ("false").
+        # When the user does not supply an expression, the filter function will
+        # be a lambda that always returns True (or always returns False), as
+        # appropriate. In either case, the function should accept a single
+        # positional argument that is the identifier name to consider.
+
+        # Include user-specified filter, or everything by default
+        include_filter = (
+            re.compile(params["include"]).search
+            if "include" in params
+            else lambda x: True
+        )
+
+        # Exclude user-specified filter, or nothing by default
+        exclude_filter = (
+            re.compile(params["exclude"]).search
+            if "exclude" in params
+            else lambda x: False
+        )
+
+    # Something is in scope when it is included and not excluded
+    return include_filter(name) and not exclude_filter(name)
 
 
 def main():

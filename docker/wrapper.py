@@ -91,6 +91,7 @@ import sys
 import time
 
 import boto3
+import requests
 
 log = logging.getLogger(__name__)
 log.setLevel(level=logging.DEBUG)
@@ -107,6 +108,26 @@ PARAMETER_FILE = "CIRRUSSCAN_PARAMETERS"
 variable_parameters = None
 include_filter = None
 exclude_filter = None
+
+
+def get_stream_id():
+    """Retrieve this ECS container's uuid"""
+
+    try:
+        # This is V3; we might not have V4-capable ECS services everywhere.
+        # See https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4.html
+        metadata_endpoint = os.environ["ECS_CONTAINER_METADATA_URI"] + "/task"
+        log.debug("Querying %s ...", metadata_endpoint)
+        response = requests.get(metadata_endpoint, timeout=5.0).json()
+        log.debug("Metadata: %s", json.dumps(response, indent=4))
+
+        # TaskARN: 'arn:aws:ecs:us-west-2:145044566291:task/57423afd-8def-45ad-8d33-e63b3a88248a'
+        # The last component is used by CloudWatch to generate the log stream for this task.
+        stream_id = response["TaskARN"].split("/")[-1]
+        return stream_id
+    except:
+        log.exception("Error retrieving metadata")
+        return None
 
 
 def put_status(status_dict, overwrite=False):
@@ -300,6 +321,11 @@ def is_in_scope(name):
 
 def main():
 
+    # Retrieve information about our runtime environment
+    stream_id = get_stream_id()
+    log.debug("Stream id: %s", stream_id)
+
+    # Retrieve the location of caller-provided data
     s3 = boto3.client("s3")
 
     if "BUCKET_ID" not in os.environ:
@@ -442,6 +468,8 @@ def main():
                 status_entry["timestamp"] = time.time()
             if "status" not in status_entry:
                 status_entry["status"] = "COMPLETE"
+            if "log_stream" not in status_entry and stream_id is not None:
+                status_entry["log_stream"] = stream_id
             log.debug(
                 "Updating task status in s3://%s/%s",
                 params_dict["status_bucket"],

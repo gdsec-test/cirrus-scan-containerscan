@@ -9,6 +9,7 @@ import logging
 import re
 
 import boto3
+import botocore.exceptions
 
 log = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -641,8 +642,27 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
                     todo.extend([f for f in donow if f["Id"] not in dud_fids])
                 else:
                     log.debug("Import response (success): %s", json.dumps(response))
+            except botocore.exceptions.ParamValidationError as oops:
+                reason = oops.args[0]
+                # 'Parameter validation failed:\nUnknown parameter in Findings[10].Compliance: "Bogus", must be one of: Status, RelatedRequirements, StatusReasons'
+                log.error("Import response (exception): %s", reason)
+
+                # Similar to above; a named finding failed to validate. Drop it
+                # and retry the remaining findings. Assuming, of course, we can
+                # successfully extract the identity of the offending finding...
+                dud = re.search(r"Findings\[([0-9]+)\]", reason)
+                if dud:
+                    dud_index = int(dud.groups()[0])  # Index in Findings list
+                    donow.pop(dud_index)  # Throw away bad finding
+                    self._demographics["kind"]["failed"] += 1  # Count it
+                    todo.extend(donow)  # Return all others to the work queue
+                else:  # We could not figure out what to do...
+                    log.error("Unable to isolate finding, discarding batch")
+                    self._demographics["kind"]["failed"] += len(donow)
             except Exception:  # pylint: disable=broad-except
+                # We don't know what went wrong, but nothing went through.
                 log.exception("SecurityHub exception:")
+                self._demographics["kind"]["failed"] += len(donow)
 
         if just_one is None:
             self._dirty = False
@@ -805,14 +825,14 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             if autoarchive:
                 self._mark_unmodified_findings(dont_archive)
 
+            # Send all changes to SecurityHub
+            self._flush_cache()
+            self._in_transaction = False
+
             # Make demo values strings to sidestep serialization issues
             for key in self._demographics:
                 for item in self._demographics[key]:
                     self._demographics[key][item] = str(self._demographics[key][item])
-
-            # Send all changes to SecurityHub
-            self._flush_cache()
-            self._in_transaction = False
         else:
             raise RuntimeError("end_transaction() called while not in transaction")
 

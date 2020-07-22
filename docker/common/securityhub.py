@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)  # pylint: disable=invalid-name
 SECURITY_HUB_REGION = "us-west-2"
 
 
-def set_severity(normalized):
+def set_severity(normalized, original=None):
     """Generate a complete ASFF Severity object"""
 
     # From AWS SecurityHub User Guide on 7/15/2019:
@@ -45,7 +45,11 @@ def set_severity(normalized):
     else:
         label = "CRITICAL"
 
-    return {"Normalized": normalized, "Product": normalized / 10.0, "Label": label}
+    sev_dict = {"Normalized": normalized, "Label": label}
+    if original is not None:
+        sev_dict["Original"] = str(original)
+
+    return sev_dict
 
 
 class Finding:  # pylint: disable=too-many-instance-attributes
@@ -621,6 +625,20 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
                 response = self._securityhub.batch_import_findings(Findings=donow)
                 if response["FailedFindings"]:
                     log.error("Import response (failure): %s", json.dumps(response))
+
+                    # Recover gracefully from this error, which commonly is due
+                    # to validation errors within a single finding in the batch.
+                    # Begin by collecting the set of failed identifiers.
+                    dud_fids = {f["Id"] for f in response["FailedFindings"]}
+
+                    # We need humans to fix the errors, so all we can do here is
+                    # count the bad findings so somebody knows there is a problem.
+                    log.error("Discarding %i requested imports", len(dud_fids))
+                    self._demographics["kind"]["failed"] += len(dud_fids)
+
+                    # Return any non-bad findings in the current batch to the
+                    # todo list, so we'll try again to send them to Security Hub.
+                    todo.extend([f for f in donow if f["Id"] not in dud_fids])
                 else:
                     log.debug("Import response (success): %s", json.dumps(response))
             except Exception:  # pylint: disable=broad-except
@@ -755,7 +773,7 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         self._load_cache()
         self._demographics = {
             "severity": {},
-            "kind": {"created": 0, "updated": 0, "archived": 0},
+            "kind": {"created": 0, "updated": 0, "archived": 0, "failed": 0},
         }
         self._began_transaction = datetime.datetime.utcnow().strftime(
             "%Y-%m-%dT%H:%M:%S.%fZ"

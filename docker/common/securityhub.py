@@ -7,6 +7,7 @@ import datetime
 import json
 import logging
 import re
+import time
 
 import boto3
 import botocore.exceptions
@@ -51,6 +52,143 @@ def set_severity(normalized, original=None):
         sev_dict["Original"] = str(original)
 
     return sev_dict
+
+
+class Business_Exception:
+    """GoDaddy Business Exception"""
+
+    def __init__(self, exception_dict):
+        """Initialize an exception"""
+
+        # Verify that required members are present in the dict
+        for k in ["exception_id", "expiration", "pattern", "version"]:
+            if k not in exception_dict:
+                raise KeyError(k)
+
+        # Just stash most of the data on the off chance we'll want it later
+        self._dict = exception_dict
+
+        # Depending on context, the exception might or might not have an account
+        # specifier. Treat "all" (if present) as not having a specifier, i.e. it
+        # matches all accounts.
+        self._account = (
+            None
+            if "all" in self._dict.get("account", ["all"])
+            else self._dict["account"]
+        )
+
+        # Convert expiration from seconds-after-epoch to YYYY-MM-DD format that
+        # is used by findings.
+        self._expiration = time.strftime(
+            "%Y-%m-%d", time.gmtime(int(self._dict["expiration"]))
+        )
+
+        # This will hold compiled regular expressions, but don't do it unless
+        # we know they're needed (i.e. JIT).
+        self._pattern = None
+
+    def __getattr__(self, k):
+        """Return value of attribute"""
+
+        # There's a few special case attributes to check first
+        if k == "account":
+            return self._account
+        if k == "expiration":
+            return self._expiration
+        if k == "pattern":
+            return self._pattern
+
+        # Anything else must be original input data
+        return self._dict.get(k, None)
+
+    def to_dict(self):
+        """Return exception as a dictionary"""
+
+        # Return the original initializer object
+        return self._dict
+
+    @staticmethod
+    def _match(key_list, value, pattern):
+        """Match specified attribute against regular expression
+
+        key_list    list of key components;
+        value       value of top-most component;
+        pattern     regular expression
+
+        1. String values are compared to pattern
+        2. Integer values are converted to strings and compared to pattern
+        3. Dict values are traversed downwards to reach a simple value
+        4. List values are traversed to verify EVERY member matches
+        5. Missing attributes do not match
+
+        For example, if key_list is ["a", "b", "c"] and value is
+        {
+            "stuff": "whatever",
+            "a": {
+                "stuff": "whatever",
+                "b": [
+                    {"c": "good", "other": "stuff"},
+                    {"c": "bad", "more": "stuff"}
+                ]
+            }
+        }
+        and pattern is "good" then we are comparing "good" against both
+        "good" (list a.b, first member, c) and "bad" (list a.b, second member,
+        c). This returns False because the second member does not match. Using
+        pattern "d$" would return True because it matches all list members.
+        """
+
+        # If value is a list, then repeat the current test against every
+        # member of the list; any failure results in a failure.
+        if isinstance(value, list):
+            for member in value:
+                if not Business_Exception._match(key_list, member, pattern):
+                    return False
+            return True
+
+        # If we are not at the terminal key, attempt to recurse
+        if key_list:
+            if isinstance(value, dict) and key_list[0] in value:
+                return Business_Exception._match(
+                    key_list[1:], value[key_list[0]], pattern
+                )
+            # Not a dict or target member doesn't exist
+            log.warning("%s not found in %s", key_list[0], value)
+            return False
+
+        # We are at the terminal key now and we can test against pattern.
+        # If the value is a string, we test directly.
+        if isinstance(value, str):
+            return True if pattern.search(value) else False
+
+        # If the value is an integer, we convert to string and test.
+        if isinstance(value, int):
+            return True if pattern.search(str(value)) else False
+
+        # We don't know how to compare this, so fail
+        log.warning("can't test against regex: %s", value)
+        return False
+
+    def applies(self, finding):
+        """Does this exception apply to the specified finding?"""
+
+        # If an account filter is present, check it first
+        if self._account and finding.AwsAccountId not in self._account:
+            return False
+
+        # If the pattern has not been compiled, do that now
+        if self._pattern is None:
+            self._pattern = {}
+            for k, v in self._dict["pattern"].items():
+                self._pattern[k] = re.compile(v)
+
+        # Oooookay. pattern is a dict, where keys are dot-delimited hierarchies
+        # of keys, and values are regular expressions. Everything must match.
+        f_dict = finding.to_dict()  # We don't want to mess with attributes
+        for k, r in self._pattern.items():  # Key, Regex
+            if not self._match(k.split("."), f_dict, r):
+                return False
+        return True
 
 
 class Finding:  # pylint: disable=too-many-instance-attributes
@@ -264,6 +402,14 @@ class Finding:  # pylint: disable=too-many-instance-attributes
             raise ValueError("identifier is read-only")
         if k in Finding.ALLOWED_FIELDS:
             if k not in self._finding or self._finding[k] != v:
+                # Special case - paper over BIF-vs-BUF incompatibility and
+                # don't consider Severity updated unless Normalized changes
+                if (
+                    k == "Severity"
+                    and self._finding.get(k, {"Normalized": ""})["Normalized"]
+                    == v["Normalized"]
+                ):
+                    return
                 self._finding[k] = v
                 self._setbyuser.add(k)
                 # How do we need to send this change?
@@ -325,8 +471,33 @@ class Finding:  # pylint: disable=too-many-instance-attributes
 
         return True
 
+    def _exception_processing(self):
+        """Potentially apply business exception to finding"""
+
+        # Are there even any rules to check?
+        rule_list = self._manager.get_exception_rules()
+        if not rule_list:
+            return
+
+        # Iteratively check all of them, stopping on the first match
+        for rule in rule_list:
+            if rule.applies(self):
+                self._finding["Workflow"]["Status"] = "SUPPRESSED"
+                if "UserDefinedFields" not in self._finding:
+                    self._finding["UserDefinedFields"] = {}
+                self._finding["UserDefinedFields"][
+                    "exception_expiration"
+                ] = rule.expiration
+                self._finding["UserDefinedFields"]["exception_id"] = rule.exception_id
+                self._finding["UserDefinedFields"]["exception_version"] = rule.version
+                return
+
     def _update_state(self):
         """Maintain timestamp attributes"""
+
+        # Test new findings against known exception rules
+        if self._isnew:
+            self._exception_processing()
 
         # Modify fields for update scenario
         utcnow = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -376,6 +547,17 @@ class Finding:  # pylint: disable=too-many-instance-attributes
         # them all over again.
         for k in self._finding:
             if k not in new_baseline or new_baseline[k] != self._finding[k]:
+
+                # Special case - paper over BIF-vs-BUF incompatibility and
+                # don't consider Severity updated unless Normalized changes
+                if (
+                    k == "Severity"
+                    and self._finding[k]["Normalized"] == new_baseline[k]["Normalized"]
+                ):
+                    self._needbut.discard("Severity")
+                    self._setbyuser.discard("Severity")
+                    continue
+
                 # This attribute effectively is being updated
                 self._setbyuser.add(k)
                 # How does it need to be sent to Security Hub?
@@ -403,13 +585,19 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
     """Wrapper for AWS Session() and extended SecurityHub semantics"""
 
     def __init__(
-        self, scope_prefix=None, scope_region=None, scope_account="self", **kwargs
+        self,
+        scope_prefix=None,
+        scope_region=None,
+        scope_account="self",
+        exception_rules=None,
+        **kwargs,
     ):
         self._session = None  # AWS Session object
         self._securityhub = None  # AWS SecurityHub object
         self._master = False  # Is this SecurityHub master account?
         self._prefix = scope_prefix  # User-supplied finding ID prefix
         self._region = scope_region  # User-supplied target region
+        self._exceptions = None  # User-supplied exception rules
         self._account_filter = None  # User-supplied target account(s)
         self._cache = {}  # In-mem finding cache
         self._in_transaction = False  # Are we buffering updates?
@@ -434,6 +622,16 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         else:  # elif scope_account == "self":
             # Only findings for our own account
             self._account_filter = [{"Comparison": "EQUALS", "Value": self._account}]
+
+        # If exception rules were provided, process them; ignore invalid rules
+        # without clobbering the rest.
+        if exception_rules:
+            self._exceptions = []
+            for rule in exception_rules:
+                try:
+                    self._exceptions.append(Business_Exception(rule))
+                except:
+                    log.warning("Ignoring invalid exception rule: %s", rule)
 
     def Finding(
         self, finding_id=None, override_dict=None, default_dict=None, merge=False
@@ -667,6 +865,66 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         if just_one is None:
             self._dirty = False
 
+    def _update_finding(self, finding, update_set):
+        """Update protected finding attributes in Security Hub"""
+
+        # Create base request
+        but_args = {
+            "FindingIdentifiers": [
+                {"Id": finding["Id"], "ProductArn": finding["ProductArn"]}
+            ]
+        }
+
+        # Include information for updated attributes (only)
+        suspense = set()
+        for attr in Finding.UPDATE_FIELDS:
+            if attr in update_set:
+                but_args[attr] = finding[attr]
+                suspense.add(attr)
+
+        # There shouldn't be anything left over
+        dropped = update_set - suspense
+        if dropped:
+            log.error(
+                "Attribute updates to %s will be ignored: %s", finding["Id"], dropped
+            )
+
+        # If there is nothing to do, do nothing
+        if not suspense:
+            log.warning("No attribute updates to %s requested", finding["Id"])
+            return update_set
+
+        # The annoying special case -- Severity (a dict). BatchImportFindings
+        # supports an optional "Original" member, but BatchUpdateFindings does
+        # not. This makes sense philosophically, but the asymmetry means we must
+        # hack around it here.
+        if "Severity" in but_args and "Original" in but_args["Severity"]:
+            fixed_severity = but_args["Severity"].copy()  # preserve original
+            del fixed_severity["Original"]  # remove illegal member
+            but_args["Severity"] = fixed_severity  # replace original argument
+
+        # Attempt to update the finding; this is relatively easy because we
+        # are only trying to update a single finding.
+        log.debug("BatchUpdateFinding: %s", but_args)
+        try:
+            response = self._securityhub.batch_update_findings(**but_args)
+            if response["UnprocessedFindings"]:
+                log.error("Update response (failure): %s", json.dumps(response))
+                suspense = set()  # assume nothing was updated
+
+                # Count this as failed, although that's a little fuzzy
+                self._demographics["kind"]["failed"] += 1
+            else:
+                log.debug("Update response (success): %s", json.dumps(response))
+        except Exception as oops:
+            reason = oops.args[0]
+            log.error("Update response (exception): %s", reason)
+            suspense = set()  # assume nothing was updated
+            self._demographics["kind"]["failed"] += 1
+
+        # Inform the caller what wasn't updated
+        return update_set - suspense
+
     def new_session(self, **kwargs):
         """Create new session and start SecurityHub import monitor"""
 
@@ -793,7 +1051,13 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         self._load_cache()
         self._demographics = {
             "severity": {},
-            "kind": {"created": 0, "updated": 0, "archived": 0, "failed": 0},
+            "kind": {
+                "created": 0,
+                "updated": 0,
+                "archived": 0,
+                "failed": 0,
+                "suppressed": 0,
+            },
         }
         self._began_transaction = datetime.datetime.utcnow().strftime(
             "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -804,10 +1068,18 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         """End a batch of SecurityHub updates"""
 
         if self._in_transaction:
-            # Compile "demographic" data about findings in transaction
+            # Compile "demographic" data about findings in transaction. Invert
+            # severities of suppressed (exception applied) findings so they do
+            # not affect severity-based compliance checks.
             for acct in self._imported_ids:
                 for finding_id in self._imported_ids[acct]:
                     sev = self._cache[acct][finding_id]["Severity"]["Normalized"]
+                    if (
+                        self._cache[acct][finding_id]["Workflow"]["Status"]
+                        == "SUPPRESSED"
+                    ):
+                        self._demographics["kind"]["suppressed"] += 1
+                        sev = -sev
                     if sev in self._demographics["severity"]:
                         self._demographics["severity"][sev] += 1
                     else:
@@ -857,8 +1129,8 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         finding_acct = f["AwsAccountId"]
 
         # The f argument is a dict of finding attributes. The *_set arguments
-        # are sets of attribute names that must be updated with
-        # BatchImportFindings or BatchUpdateFindings, respectively.
+        # are sets of attribute names with modified values that must be updated
+        # with BatchImportFindings or BatchUpdateFindings, respectively.
         #
         # Assertion 1: If both sets are non-empty, it is always safe to do the
         # update before the import. Proof by contradiction: update requires the
@@ -867,21 +1139,28 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         # attributes, and update_set will be empty. This contradicts our initial
         # assertion that update_set is non-empty. QED. If you are wondering why
         # we care, historically we did some fixups of "import" fields based on
-        # chanes to "update" fields; using the opposite order would cause our
+        # changes to "update" fields; using the opposite order would cause our
         # fixup to be undone by import before update could change the primary
         # field. Therefore, the place to do the update is here.
         #
-        # Assertion 2: Generally, no useful updates can be performed. The _load_*
-        # methods above restrict retrieved findings to the current account. The
-        # BatchUpdateFindings call requires the current account to be the master
-        # account. Findings of interest probably belong to the member accounts,
-        # which can't update them. The point of this assertion is to justify
-        # whining and doing nothing in the event an update actually is requested.
+        # Assertion 2: It is significantly easier to do updates now (instead of
+        # later). If we are inside a transaction, the import will be delayed
+        # until the end of the transaction, an indefinite point in the future.
+        # We would like to avoid having to defer the update (so it always comes
+        # after the import), and we do that by doing it first instead.
+        #
+        # Assertion 3: It's not worth batching BatchUpdateFindings. Technically
+        # it's possible, but this requires that all findings are going to have
+        # the same update applied (all are having severity changed to exactly
+        # the same value "x", etc.). That is unlikely to be the case. Also, it
+        # is uncommon for restricted ("update"able vs "import"able) attributes
+        # to be changed on existing (vs new) findings, so the total number of
+        # finding updates is expected to be small, and overhead reduction gained
+        # by batching to be small also. Therefore, when an update is required,
+        # we will update each target finding immediately.
 
         if update_set:
-            log.error(
-                "Attribute updates to %s will be ignored: %s", finding_id, update_set
-            )
+            self._update_finding(f, update_set)
 
         # Theoretically, import_set could be empty and we could skip any
         # remaining work. In practice, the act of calling .save() modifies
@@ -928,3 +1207,8 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         if effective_acct not in self._imported_ids:
             self._imported_ids[effective_acct] = set()
         self._imported_ids[effective_acct].add(finding_id)
+
+    def get_exception_rules(self):
+        """Return exception rules"""
+
+        return self._exceptions

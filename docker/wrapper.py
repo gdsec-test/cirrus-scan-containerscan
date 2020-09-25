@@ -41,6 +41,10 @@ following parameters:
     outputs (optional)
         specifies any output files that should be copied to S3 buckets
 
+    exceptions_object (optional)
+        specifies the S3 object (in BUCKET_ID, above) that contains rules for
+        business exceptions applicable to this account
+
     status_bucket (optional)
     status_object (optional)
         specifies the S3 bucket and object that should be updated with the task
@@ -104,10 +108,12 @@ log.addHandler(logging_handler)
 STATUS_FILE = "CIRRUSSCAN_STATUS"
 ARGUMENT_FILE = "CIRRUSSCAN_ARG"
 PARAMETER_FILE = "CIRRUSSCAN_PARAMETERS"
+EXCEPTIONS_FILE = "CIRRUSSCAN_EXCEPTIONS"
 
 variable_parameters = None
 include_filter = None
 exclude_filter = None
+exception_rules = None
 
 
 def get_stream_id():
@@ -212,6 +218,36 @@ def merge_status(target_dict, other_dict):
         else:
             # We have no idea what to do
             target_dict[k] = "(multiple)"
+
+
+def get_exception_rules(default=[]):
+    """Retrieve exceptions list from task request"""
+
+    global exception_rules
+
+    # Transparently load from state file if we haven't done so yet
+    if exception_rules is None:
+        p = pathlib.Path(EXCEPTIONS_FILE)
+        try:
+            with p.open("r") as f:
+                raw_rules = json.load(f)
+        except:
+            log.error("Could not read %s", EXCEPTIONS_FILE)
+            exception_rules = default
+            return exception_rules
+
+        # There could be some (significant) latency between when rules
+        # are updated and when they are published; in particular, some
+        # of the supplied rules might have expired (or be about to expire).
+        # Remove those so the caller doesn't have to think about it.
+
+        # Although these timestamps are maintained as seconds-from-epoch,
+        # in practice we only use calendar day granularity, so this can be
+        # pretty sloppy. We'll use a cutoff 2 hours in the future.
+        cutoff = int(time.time()) + 7200
+        exception_rules = [rule for rule in raw_rules if rule["expiration"] > cutoff]
+
+    return exception_rules
 
 
 def get_parameters(default={}):
@@ -355,6 +391,24 @@ def main():
     log.debug("Parameters (original):\n%s", params_str)
     params_dict = json.loads(params_str)
     log.debug("Parameters (parsed): %s", json.dumps(params_dict))
+
+    # Look for exceptions data. If found, attempt to stash this in a local
+    # file so it can be read via callback later.
+
+    if "exceptions_object" in params_dict:
+        log.debug(
+            "Retrieving exceptions data from s3://%s/%s",
+            bucket_id,
+            params_dict["exceptions_object"],
+        )
+        try:
+            s3.download_file(
+                Bucket=bucket_id,
+                Key=params_dict["exceptions_object"],
+                Filename=EXCEPTIONS_FILE,
+            )
+        except Exception as e:
+            log.warning("Unable to retrieve exceptions data: %s", e)
 
     # Set environment variables
 

@@ -402,13 +402,8 @@ class Finding:  # pylint: disable=too-many-instance-attributes
             raise ValueError("identifier is read-only")
         if k in Finding.ALLOWED_FIELDS:
             if k not in self._finding or self._finding[k] != v:
-                # Special case - paper over BIF-vs-BUF incompatibility and
-                # don't consider Severity updated unless Normalized changes
-                if (
-                    k == "Severity"
-                    and self._finding.get(k, {"Normalized": ""})["Normalized"]
-                    == v["Normalized"]
-                ):
+                # Severity is compared differently
+                if k == "Severity" and self._same_severity(v):
                     return
                 self._finding[k] = v
                 self._setbyuser.add(k)
@@ -419,6 +414,29 @@ class Finding:  # pylint: disable=too-many-instance-attributes
                     self._needbit.add(k)
         else:
             super().__setattr__(k, v)
+
+    def _same_severity(self, new_severity):
+        """Is supplied severity the same as this finding's severity?"""
+
+        # Severities have multiple properties, but not all of them are mandatory
+        # or even legal in some contexts. To reduce thrashing, concentrate on a
+        # subset of properties that should always be present, and compare only
+        # those.
+
+        # If we have no severity at all, we can't be the same as anything
+        if "Severity" not in self._finding:
+            return False
+
+        # We expect/require these attributes to be present, so if one is missing,
+        # we again consider this "not a match"
+        try:
+            for attribute in ["Label", "Normalized"]:
+                if self._finding["Severity"][attribute] != new_severity[attribute]:
+                    return False
+        except KeyError:
+            return False
+
+        return True
 
     def to_dict(self):
         """Return a dict of the finding's attributes"""
@@ -489,7 +507,9 @@ class Finding:  # pylint: disable=too-many-instance-attributes
                     "exception_expiration"
                 ] = rule.expiration
                 self._finding["UserDefinedFields"]["exception_id"] = rule.exception_id
-                self._finding["UserDefinedFields"]["exception_version"] = rule.version
+                self._finding["UserDefinedFields"]["exception_version"] = str(
+                    rule.version
+                )
                 return
 
     def _update_state(self):
@@ -548,12 +568,8 @@ class Finding:  # pylint: disable=too-many-instance-attributes
         for k in self._finding:
             if k not in new_baseline or new_baseline[k] != self._finding[k]:
 
-                # Special case - paper over BIF-vs-BUF incompatibility and
-                # don't consider Severity updated unless Normalized changes
-                if (
-                    k == "Severity"
-                    and self._finding[k]["Normalized"] == new_baseline[k]["Normalized"]
-                ):
+                # Severity is compared differently
+                if k == "Severity" and self._same_severity(new_baseline[k]):
                     self._needbut.discard("Severity")
                     self._setbyuser.discard("Severity")
                     continue

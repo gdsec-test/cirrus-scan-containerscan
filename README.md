@@ -1,27 +1,102 @@
-# CirrusScan check
+# cirrus-scan-portscan
 
-CirrusScan will run checks against the AWS infrastructure using configuration
-data contained within this directory hierarchy.  Each check is self contained,
-and has its configuration data defined in a separate subdirectory.  An
-arbitrary directory structure may be constructed under the `checks`
-subdirectory in this repo.
+CirrusScan check: Open Port Scanner
 
-## Configuration
+[CirrusScan](https://github.secureserver.net/appservices/CirrusScan) utilizes
+[masscan](https://github.com/robertdavidgraham/masscan) to identify open ports
+on targeted systems. This scan is performed using a container encapsulating the
+logic required to evaluate the target environments, identify nonconformant ports,
+and forward findings to
+[Security Hub](https://docs.aws.amazon.com/securityhub/latest/userguide/)
+for presentation.
 
-Configuration may be specified via one or more JSON or YAML files that are
-suffixed with a `.json` or `.yaml` file extension, respectively.
+This scanner targets primarily non-AWS hosted environments (such as systems
+located in an on-premise data center). Native AWS environments are more effectively
+inspected using the
+[ScoutSuite scanner](https://github.secureserver.net/appservices/cirrus-scan-scoutsuite),
+which (among other things) evaluates AWS security group configuration instead of
+generating live network traffic to target systems.
 
-*TODO: describe format of configuration files*
+Refer to [docker/README.md](docker/README.md) for details on how to construct
+and promote the container used for scanning. Note that all tailoring is
+performed at container build time.
 
-## Scheduling
+## Workflow
 
-*TODO: describe when/how checks are scheduled*
+NOTE: Certain aspects of this description refer to planned future functionality
+which have not been implemented.
 
-## Execution
+Users can trigger vulnerability scans on their own account or on multiple
+accounts, depending on their role and authorization.
 
-*TODO: describe when/how checks are executed*
+A scan request must specify:
 
-## Reporting
+* An AWS LOB account. This account will be used to execute the ECS-based
+  CirrusScan scanner instance; the account must be configured for Direct Connect
+  in order to specify a scan source.
 
-*TODO: describe how and where check results are reported*
+* A target. This may consist of one or more IPv4 CIDR specifications, or one or
+  zone names. A zone will be translated into an equivalent list of subnets using
+  CMDB queries performed by the scanner.
 
+A scan request may specify:
+
+* A default port template. The template specifies the set of permitted open ports
+  for systems where the associated template cannot be retrieved from the CMDB
+  (such as when an explicit CIDR target is provided and no CMDB lookup is
+  performed). By default, no open ports are permitted.
+
+* A source. This consists of one or more zone names; when present, the actual
+  scan traffic will originate from an IPv4 address within the specified zone.
+  By default, scan traffic will originate from the ECS-based CirrusScan scanner
+  instance.
+
+When a port scan is requested, the following activities take place:
+
+1. CirrusScan will execute an ECS task in the specified AWS account to
+   coordinate the scan.
+2. If the target is specified by zone, the ECS task looks up the subnets
+   associated with each zone and uses these as scan targets.
+3. If a source is specified, the ECS task will provision an ephemeral
+   OpenStack VM (if possible) or select a persistent scanner host (if necessary)
+   located within the specified source zone. If multiple sources zones are
+   specified, multiple scanner instances will be utilized. The special zone
+   "internet" will cause the scanner to execute on the ECS task instance itself.
+4. The masscan scanner will be invoked, using the target subnet list, at the
+   desired source location(s).
+5. Scan results will be transmitted to the ECS task instance (if the scanner was
+   executed remotely).
+6. Any ephemeral VMs created for the scan will be unprovisioned.
+7. The raw data will be examined for nonconformances. For CMDB-assisted scans,
+   responding IPv4 addresses will be matched to host CIs and then to a port
+   template. If no lookup is made, or a template cannot be found, the default
+   template specified by the request will be used.
+8. A Security Hub finding will be generated for each open port which does not
+   match the relevant template. Where available, this finding will be enriched
+   with CI identification and the supporting ServiceNow oncall team.
+9. CirrusScan libraries transparently correlate these findings with earlier
+   observations, resulting in the automatic creation, update or archiving of
+   Security Hub findings as appropriate. (CirrusScan subsequently forwards these
+   findings to ServiceNow, opening or closing tickets as required.)
+10. The ECS task instance stores output and status data in S3 for further review.
+11. The ECS task terminates.
+
+## Logging and Debugging
+
+After launching a scan from API gateway, the requester may go to the ECS
+dashboard from AWS console and verify that an ECS task named **portscan** is running.
+
+Next, to find debugging logs from the container, go to Cloudwatch logs, and
+filter logs by **/ecs/portscan**. You should see the debugging logs from the
+portscan container in the most recent log stream. Please verify the last event time.
+  
+## Security Findings
+
+By design, all portscan findings are created with severity **HIGH**.
+Findings generated by this check can be found by applying following filters on
+Security Hub:
+
+* Record State _EQUALS_ ACTIVE
+* ID _PREFIX_ portscan/
+  
+For any further assistance, please reach out to DL-AppSecurity@godaddy.com.

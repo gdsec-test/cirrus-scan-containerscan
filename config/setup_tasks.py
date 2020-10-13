@@ -51,6 +51,7 @@ def main():
                 "TASK_MEMORY": "1024",
                 "TASK_IMAGE": task_image,
                 "TASK_PARAMETERS": task_configuration,
+                "TASK_SCHEDULE": "manual",
             },
         }
     )

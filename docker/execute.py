@@ -73,7 +73,7 @@ if __name__ == "__main__":
     scan_info = handle.get_finding_data()
     compliance = "PASS"
     for severity in scan_info["severity"]:
-        if severity >= fail_at:
+        if severity >= 70:
             compliance = "FAIL"
             break
     wrapper.put_status(

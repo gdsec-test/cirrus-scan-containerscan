@@ -11,6 +11,10 @@ exactly one element.
 
 This element may optionally define the following keys:
 
+* `source`: The name of the zone where port probes will originate. If the name
+  is unrecognized, *no scan is performed.* The zone name `aws` (the default)
+  means scanning will be performed from the ECS task instance.
+
 * `servicenow_instance`: A designator (such as `prod` or `dev`) indicating
   the ServiceNow instance that should be recorded in findings. By default,
   no instance is recorded and CirrusScan will communicate with the default

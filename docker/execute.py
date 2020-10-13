@@ -38,29 +38,49 @@ def generate_informational_finding(handle, scope_name):
     f.save()
 
 
-if __name__ == "__main__":
-    # Adjust log format and content
-    logging.basicConfig(
-        level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
-    )
-
-    logging.getLogger("botocore").setLevel(logging.WARNING)
-    logging.getLogger("boto3").setLevel(logging.INFO)
-    logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+def main():
+    """Top-Level Scanner Control Flow"""
 
     # Get parameters from caller
     parameters = wrapper.get_parameters()
-    exception_rules = wrapper.get_exception_rules()
-
     scope_name = parameters.get("scope", "default")
+    snow_instance = parameters.get("servicenow_instance", None)
+    source_zone = parameters.get("source", "aws")
+    port_severity = parameters.get("openport_severity", 70)
+
+    # If the source zone is unrecognized, we can't do anything
+    if source_zone != "aws":
+        log.error("Unrecognized source zone %s", source_zone)
+        wrapper.put_status(
+            {"status": "FAILED", "comment": "Unrecognized source " + source_zone}
+        )
+        return
+
+    # +-------------------------------------------------------+
+    # | TODO: Provision remote scanner if source is not "aws" |
+    # +-------------------------------------------------------+
+
+    # +-------------------------------------------------------+
+    # | TODO: Execute scanner                                 |
+    # +-------------------------------------------------------+
+
+    # +-------------------------------------------------------+
+    # | TODO: Retrieve scanner results                        |
+    # +-------------------------------------------------------+
+
+    # +-------------------------------------------------------+
+    # | TODO: Deprovision remote scanner if provisioned above |
+    # +-------------------------------------------------------+
 
     # Initialize Security Hub context
-    handle = common.securityhub.SecurityHub_Manager(exception_rules=exception_rules)
+    handle = common.securityhub.SecurityHub_Manager(
+        exception_rules=wrapper.get_exception_rules()
+    )
     handle.begin_transaction(scope_prefix="portscan/" + scope_name + "/")
 
-    # +----------------------------+
-    # |  ALL SCAN LOGIC GOES HERE  |
-    # +----------------------------+
+    # +-------------------------------------------------------+
+    # | TODO: Create findings for all nonconformances         |
+    # +-------------------------------------------------------+
 
     # Report scan completion and flush changes to Security Hub
     generate_informational_finding(handle, scope_name)
@@ -79,3 +99,17 @@ if __name__ == "__main__":
     wrapper.put_status(
         {"status": "SUCCESS", "compliance": compliance, "finding_data": scan_info}
     )
+
+
+if __name__ == "__main__":
+    # Adjust log format and content
+    logging.basicConfig(
+        level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+
+    logging.getLogger("botocore").setLevel(logging.WARNING)
+    logging.getLogger("boto3").setLevel(logging.INFO)
+    logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
+    # Perform the scan
+    main()

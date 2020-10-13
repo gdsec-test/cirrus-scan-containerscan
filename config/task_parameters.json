@@ -1,0 +1,19 @@
+{
+    "default": [
+        {
+            "enabled": false,
+            "servicenow_instance": "default"
+        }
+    ],
+    "FIXME1-Dev-Private": [
+        {
+            "enabled": true,
+            "servicenow_instance": "dev"
+        }
+    ],
+    "FIXME2-Prod": [
+        {
+            "enabled": false
+        }
+    ]
+}

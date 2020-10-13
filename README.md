@@ -48,8 +48,8 @@ A scan request may specify:
 
 * A source. This consists of one or more zone names; when present, the actual
   scan traffic will originate from an IPv4 address within the specified zone.
-  By default, scan traffic will originate from the ECS-based CirrusScan scanner
-  instance.
+  The default source is `aws`, which means scan traffic will originate from the
+  ECS-based CirrusScan task instance.
 
 When a port scan is requested, the following activities take place:
 
@@ -61,7 +61,7 @@ When a port scan is requested, the following activities take place:
    OpenStack VM (if possible) or select a persistent scanner host (if necessary)
    located within the specified source zone. If multiple sources zones are
    specified, multiple scanner instances will be utilized. The special zone
-   "internet" will cause the scanner to execute on the ECS task instance itself.
+   "aws" will cause the scanner to execute on the ECS task instance itself.
 4. The masscan scanner will be invoked, using the target subnet list, at the
    desired source location(s).
 5. Scan results will be transmitted to the ECS task instance (if the scanner was

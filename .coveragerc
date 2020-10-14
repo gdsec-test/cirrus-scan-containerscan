@@ -1,0 +1,19 @@
+# .coveragerc to control coverage.py
+[run]
+branch = True
+
+[report]
+show_missing = True
+
+include =
+    docker/*.py
+
+omit =
+    docker/common/*.py
+    docker/wrapper.py
+
+# Regexes for lines to exclude from consideration
+exclude_lines =
+    # Don't complain if non-runnable code isn't run:
+    if 0:
+    if __name__ == .__main__.:

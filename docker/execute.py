@@ -38,6 +38,17 @@ def generate_informational_finding(handle, scope_name):
     f.save()
 
 
+def test_compliance(scan_info, max_pass=69):
+    """Returns 'PASS' or 'FAIL'"""
+
+    # We are compliant if no findings exist with severities greater than max_pass
+    # (default 69 - aka LOW and MEDIUM are permissible, but not HIGH or CRITICAL)
+    for severity in scan_info["severity"]:
+        if severity > max_pass:
+            return "FAIL"
+    return "PASS"
+
+
 def main():
     """Top-Level Scanner Control Flow"""
 
@@ -91,11 +102,7 @@ def main():
     # exist with severities greater than 69. (aka LOW and MEDIUM are
     # permissible, but not HIGH or CRITICAL -- and high starts at 70.)
     scan_info = handle.get_finding_data()
-    compliance = "PASS"
-    for severity in scan_info["severity"]:
-        if severity >= 70:
-            compliance = "FAIL"
-            break
+    compliance = test_compliance(scan_info)
     wrapper.put_status(
         {"status": "SUCCESS", "compliance": compliance, "finding_data": scan_info}
     )

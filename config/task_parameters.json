@@ -1,19 +1,25 @@
 {
-    "default": [
+    "commands": [
+        "/execute.py"
+    ],
+    "environment": [
         {
-            "enabled": false,
-            "servicenow_instance": "default"
+            "name": "CIRRUS_SCAN_RESULTS_BUCKET",
+            "value": "___CIRRUS_SCAN_RESULTS_BUCKET___"
+        },
+        {
+            "name": "CIRRUS_SCAN_TASK_UUID",
+            "value": "___CIRRUS_SCAN_TASK_UUID___"
+        },
+        {
+            "name": "CIRRUS_SCAN_ACCOUNT_ENVIRONMENT",
+            "value": "___CIRRUS_SCAN_ACCOUNT_ENVIRONMENT___"
+        },
+        {
+            "name": "CIRRUS_SCAN_ACCOUNT_TEAM_NAME",
+            "value": "___CIRRUS_SCAN_ACCOUNT_TEAM_NAME___"
         }
     ],
-    "FIXME1-Dev-Private": [
-        {
-            "enabled": true,
-            "servicenow_instance": "dev"
-        }
-    ],
-    "FIXME2-Prod": [
-        {
-            "enabled": false
-        }
-    ]
+    "status_bucket": "___CIRRUS_SCAN_RESULTS_BUCKET___",
+    "status_object": "___CIRRUS_SCAN_RESULTS_OBJECT___/CIRRUS_SCAN_TASK_STATUS"
 }

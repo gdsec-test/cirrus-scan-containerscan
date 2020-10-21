@@ -33,11 +33,15 @@ class ProvisioningTimeoutError(Exception):
     pass
 
 
-class RegistrationTimeoutError(Exception):
-    """Provision operation timed out"""
+class RegistrationError(Exception):
+    """ECR registry registration operation error"""
 
     pass
 
+class ForceScanError(Exception):
+    """Force scan operation error"""
+
+    pass
 
 class ScanningTimeoutError(Exception):
     """Scanning operation timed out"""
@@ -58,7 +62,7 @@ class SecretManagerRetrievalError(Exception):
 
 
 class ExitContainerScanner(Exception):
-    """One of the resources required to run VulnScanner is missing. Exiting!"""
+    """One of the resources required to run ContainerScanner is missing. Exiting!"""
 
     pass
 
@@ -90,7 +94,7 @@ def assume_role(role_arn):
 
 
 def getPrismaToken():
-    """Retrieves Tenable API keys from Secret Manager"""
+    """Retrieves Prisma Access key and secret key id from Secret Manager"""
     secret_name = "PrismaAccessKeys"
     region_name = "us-west-2"
 
@@ -197,11 +201,299 @@ def getPrismaToken():
 def region_has_repos(region):
     """Parse through parameters, and get scan targets"""
     
-    client = boto3.client("ecr", region_name=region)
+    ecr_client = boto3.client("ecr", region_name=region)
+    repositories = ecr_client.describe_repositories()["repositories"]
+    repositories_uris = [repository["repositoryUri"] for repository in repositories]
 
-    response = client.describe_repositories()
+    return len(repositories_uris) > 0
     
-    return len(response["repositories"])>0
+
+def create_prisma_api_request(req_type,url,token=None,payload=None, params=None):
+    """Helper function to make Tenable API requests"""
+
+    # As we may hit Prisma API limits, try hitting Prisma at least 3 times before shutting down Vulnerability Scanner
+    retries = Retry(
+        total=3,
+        status_forcelist={429, 501, 502, 503, 504},
+        backoff_factor=1,
+        respect_retry_after_header=True,
+    )
+
+    headers = None
+    if token is not None:
+        headers = {"Authorization":"Bearer " + token} 
+     
+
+    response = None
+
+    try:
+        adapter = requests.adapters.HTTPAdapter(max_retries=retries)
+
+        # initiate the session and then attach the Retry adaptor.
+        session = requests.Session()
+        session.mount("https://", adapter)
+
+        # add the API keys to the session.
+        session.headers = headers
+        fullurl = PRISMA_COMPUTE_REST_API_URL + url
+        # now make calls using session
+        if req_type == "POST":
+            response = session.post(fullurl, params=params, data=payload, timeout=5.0)
+        else:
+            response = session.get(fullurl, params=params, data=payload, timeout=5.0)
+
+        if response.status_code == 200:
+            return response
+    except:
+        log.exception("Exception occurred in making Tenable request")
+
+    log.error(
+        "Prisma API call from %s method returning status code: %i.",
+        url,
+        response.status_code,
+    )
+
+    log.error("Prisma API call failed from method: %s. Exiting!", url)
+    raise ExitContainerScanner
+
+def force_ecr_registry_scan(token, region, account_id):
+    
+    # curl -H "Authorization: Bearer "${TOKEN}"" -X POST -d '{"registry":"226955763576.dkr.ecr.us-west-2.amazonaws.com","repository":"","tag":"","cap":5,"os":"linux","hostname":"","namespace":"","useAWSRole":true,"version":"aws","credential":{"_id":"","type":"","accountID":"","accountGUID":"","secret":{"encrypted":""},"apiToken":{"encrypted":""},"lastModified":"0001-01-01T00:00:00Z","owner":"","tokens":null},"credentialID":"","roleArn":"","scanners":1,"versionPattern":""}' https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/settings/registry
+    ecr_registry_name = account_id + ".dkr.ecr." + region + ".amazonaws.com"
+    reg = '{"tag":{"registry":""}}'
+    reg_json = json.loads(reg)
+    reg_json["registry"] = ecr_registry_name
+    
+    response = create_prisma_api_request("POST", "/registry/scan", token=token, payload=json.dumps(reg_json))
+
+    if response.status_code == 200:
+        logging.info("Forced scan of ECR registry %s!", ecr_registry_name )
+        return 
+    else:
+        logging.error("Unable to force scan of ECR registry %s!", ecr_registry_name )
+
+    raise ForceScanError
+
+def register_ecr_registry(token, region, account_id, vpc_id):
+    """Register ECR registry with Prisma"""
+    log.info("Waiting for Tenable scanner registration")
+
+    # make a call to get the name of the provisioned scanner
+    client = boto3.client("ec2")
+    response = client.describe_instances(
+        Filters=[
+            {"Name": "tag:Name", "Values": ["ContainerScanner"]},
+            {"Name": "instance-state-name", "Values": ["running"]},
+            {"Name": "vpc-id", "Values": [vpc_id]},
+        ]
+    )
+    
+    try:
+        scanner_dnsname = response["Reservations"][0]["Instances"][0]["NetworkInterfaces"][
+            0
+        ]["PrivateDnsName"]
+        log.info("Scanner name : %s" % scanner_dnsname)
+    except KeyError:
+        log.error("Scanner IP not found")
+        scanner_dnsname = None
+
+    if scanner_dnsname:
+        # register ECR registry
+        # curl -H "Authorization: Bearer "${TOKEN}"" -X POST -d '{"registry":"226955763576.dkr.ecr.us-west-2.amazonaws.com","repository":"","tag":"","cap":5,"os":"linux","hostname":"","namespace":"","useAWSRole":true,"version":"aws","credential":{"_id":"","type":"","accountID":"","accountGUID":"","secret":{"encrypted":""},"apiToken":{"encrypted":""},"lastModified":"0001-01-01T00:00:00Z","owner":"","tokens":null},"credentialID":"","roleArn":"","scanners":1,"versionPattern":""}' https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/settings/registry
+        ecr_registry_name = account_id + ".dkr.ecr." + region + ".amazonaws.com"
+        reg = '{"registry":"","repository":"","tag":"","cap":5,"os":"linux","hostname":"","namespace":"","useAWSRole":true,"version":"aws","credential":{"_id":"","type":"","accountID":"","accountGUID":"","secret":{"encrypted":""},"apiToken":{"encrypted":""},"lastModified":"0001-01-01T00:00:00Z","owner":"","tokens":null},"credentialID":"","roleArn":"","scanners":1,"versionPattern":""}'
+        reg_json = json.loads(reg)
+        reg_json["registry"] = ecr_registry_name
+        reg_json["hostname"] = scanner_dnsname
+        response = create_prisma_api_request("POST", "settings/registry", token=token, payload=json.dumps(reg_json))
+
+        if response.status_code == 200:
+            logging.info("Registered %s with ECR registry %s!", scanner_dnsname, ecr_registry_name )
+            return 
+        else:
+            logging.error("Unable to register %s with ECR registry %s!", scanner_dnsname, ecr_registry_name )
+
+    raise RegistrationError
+
+def wait_for_scan_completion(token,region, account_id):
+    """Wait for the scan to be completed"""
+
+    log.info("Waiting for Container Scan to finish")
+    # sleep for 45 minutes due to lack of progress api
+    time.sleep(45*60)
+
+    # # This loop runs for ~60 minutes, to wait for Prisma scan completion
+    # for setup_count in range(60):
+    #     log.info("Getting Tenable Scan Status")
+    #     time.sleep(60)
+        
+    #     offset = 1
+    #     limit = 50
+    #     params ={"limit":limit,"offset":offset}
+
+    #     while True:
+    #         response = create_prisma_api_request("GET", "registry/progress", token=token, params=params)
+    #         data = json.loads(response.text)
+           
+    #         for x in data['registry']:
+    #             ## registry still being scanned
+    #             if(x == registry): 
+    #                 break;
+
+    #         if len(data) < limit:
+    #             ## at this point, we have exhaused the list and didnt find the one, meaning it is done.
+    #             return;    
+    #         #continue with next page
+    #         offset += limit     
+
+    # log.error("Scanning timed out")
+    # raise ScanningTimeoutError
+
+
+def retrieve_scanner_results(token, region, account_id):
+       
+    # https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/registry/download?registry="226955763576.dkr.ecr.us-east-1.amazonaws.com" 
+    ecr_registry_name = account_id + ".dkr.ecr." + region + ".amazonaws.com"
+    param = "registry=" + ecr_registry_name
+    
+    # all results in csv format
+    response = create_prisma_api_request("GET", "/registry/download", token=token, params=param)
+
+    if response.status_code == 200:
+        logging.info("Retrieve scan results from ECR registry %s.", ecr_registry_name )
+        return response.text
+    else:
+        logging.error("Unable to retrieve scan results from ECR registry %s.", ecr_registry_name )
+
+
+def evaluate_scanner_results(handle, csv_results):
+    """Evaluate scanner results and generate Security Hub findings."""
+    log.info("Evaluating Tenable scanner results")
+
+    csv_results = csv.DictReader(csv_results.split("\r\n"), delimiter=",")
+
+    for result in csv_results:
+        if result["Risk"] in ("Low", "Medium", "High"):
+            severity = result.get("Risk", "NONE")
+            title = result.get("Name", "UNKNOWN")
+            description = result.get("Synopsis", "")
+            solution = result.get("Solution", "")
+            url = result.get("See Also", "None").split("\n")[0]
+            host = result.get("Host", "")
+
+            title_id = title.replace(" ", "-")
+
+            # Generate a SecurityHub finding
+            overrides = {}
+            overrides["Id"] = "vulnscan/%s/%s/%s/%s" % (
+                handle.aws_region(),
+                vpc_id,
+                host,
+                title_id,
+            )
+            overrides["Title"] = "Vulnerability Scan [%s, %s]" % (
+                handle.aws_region(),
+                title,
+            )
+            overrides["Description"] = (
+                "The Tenable scanner detected an issue (%s)" % description
+            )
+            overrides["Remediation"] = {"Recommendation": {"Text": solution}}
+            overrides["Resources"] = [
+                {"Type": "AwsEc2Instance", "Id": host, "Region": handle.aws_region()}
+            ]
+
+            overrides["GeneratorId"] = "Vulnerability Scan"
+            overrides["Compliance"] = {"Status": "FAILED"}
+
+            if url != "":
+                overrides["SourceUrl"] = url
+
+            if severity == "High":
+                overrides["Severity"] = common.securityhub.set_severity(
+                    75, original=severity
+                )
+            elif severity == "Medium":
+                overrides["Severity"] = common.securityhub.set_severity(
+                    50, original=severity
+                )
+            elif severity == "Low":
+                overrides["Severity"] = common.securityhub.set_severity(
+                    25, original=severity
+                )
+            try:
+                finding = handle.Finding(overrides["Id"], override_dict=overrides)
+                finding.save()
+            except Exception:
+                log.exception("Error while processing scanner result:")
+
+
+def save_scanner_results(results):
+    """Save scanner results to an S3 bucket."""
+    log.info("Saving Tenable scanner results")
+
+    results_bucket = os.getenv("CIRRUS_SCAN_RESULTS_BUCKET")
+    task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
+    results_key = "containerscan/%s/results.csv" % task_uuid
+
+    csv_results = csv.reader(results.split("\r\n"), delimiter=",")
+
+    temp_csv = "/tmp/results.csv"
+    container_results_csv = open(temp_csv, "w")
+    csv_writer = csv.writer(container_results_csv)
+
+    for result in csv_results:
+        csv_row = result
+        csv_writer.writerow(csv_row)
+
+    container_results_csv.close()
+    try:
+        s3 = boto3.client("s3")
+        s3.upload_file(temp_csv, results_bucket, results_key)
+    except botocore.exceptions.ClientError:
+        log.exception(
+            "put_object failed for: bucket: %s with key: %s",
+            results_bucket,
+            results_key,
+        )
+
+    if os.path.isfile(temp_csv):
+        os.remove(temp_csv)
+
+
+def deprovision_scanner(provisioned_product_name):
+    """Deprovision a Tenable scanner, using CloudFront, Service Catalog, EC2, etc."""
+    log.info("Deprovisioning container scanner")
+
+    headers = tenable_keys["headers"]
+
+    # Terminate VulnScanner Service Catalog Product from AWS account
+    try:
+        client = boto3.client("servicecatalog")
+        response = client.terminate_provisioned_product(
+            ProvisionedProductName=provisioned_product_name
+        )
+
+        log.info("VulnScanner SC product successfully deleted!")
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            log.info("VulnScanner do not exist! No need to deprovision!")
+        else:
+            log.error("Error in deleting the VulnScanner SC product from AWS account")
+            log.error(e.response["Error"]["Message"])
+
+    # Terminate Scanner from Tenable.io
+    if scanner_details and "scanner_id" in scanner_details:
+        scanner_id = scanner_details["scanner_id"]
+        try:
+            url = "https://cloud.tenable.com/scanners/" + str(scanner_id)
+            response = create_tenable_api_request(
+                "deprovision_scanner", "DELETE", url, headers
+            )
+            log.info("Scanner successfully de-registered from Tenable cloud!")
+        except:
+            log.error("Unable to de-register scanner from Tenable cloud")
 
 
 def provision_scanner(vpc_id):
@@ -273,368 +565,6 @@ def provision_scanner(vpc_id):
         log.error(response)
         raise ProvisioningTimeoutError
     return provisioned_product_name
-
-
-def create_prisma_api_request(req_type,url,token=None,payload=None, params=None):
-    """Helper function to make Tenable API requests"""
-
-    # As we may hit Prisma API limits, try hitting Prisma at least 3 times before shutting down Vulnerability Scanner
-    retries = Retry(
-        total=3,
-        status_forcelist={429, 501, 502, 503, 504},
-        backoff_factor=1,
-        respect_retry_after_header=True,
-    )
-
-    headers = None
-    if token is not None:
-        headers = {"Authorization":"Bearer " + token} 
-     
-
-    response = None
-
-    try:
-        adapter = requests.adapters.HTTPAdapter(max_retries=retries)
-
-        # initiate the session and then attach the Retry adaptor.
-        session = requests.Session()
-        session.mount("https://", adapter)
-
-        # add the API keys to the session.
-        session.headers = headers
-        fullurl = PRISMA_COMPUTE_REST_API_URL + url
-        # now make calls using session
-        if req_type == "POST":
-            response = session.post(fullurl, params=params, data=payload, timeout=5.0)
-        else:
-            response = session.get(fullurl, params=params, data=payload, timeout=5.0)
-
-        if response.status_code == 200:
-            return response
-    except:
-        log.exception("Exception occurred in making Tenable request")
-
-    log.error(
-        "Prisma API call from %s method returning status code: %i.",
-        url,
-        response.status_code,
-    )
-
-    log.error("Prisma API call failed from method: %s. Exiting!", url)
-    raise ExitContainerScanner
-
-
-def wait_for_scanner_registration(vpc_id):
-    """Wait for the provisioned scanner to be registered with Tenable."""
-    log.info("Waiting for Tenable scanner registration")
-
-    # make a call to get the name of the provisioned scanner
-    headers = tenable_keys["headers"]
-    client = boto3.client("ec2")
-    response = client.describe_instances(
-        Filters=[
-            {"Name": "tag:Name", "Values": ["TenableScanner"]},
-            {"Name": "instance-state-name", "Values": ["running"]},
-            {"Name": "vpc-id", "Values": [vpc_id]},
-        ]
-    )
-
-    region = boto3.session.Session().region_name
-    account_id = boto3.client("sts").get_caller_identity().get("Account")
-    scanner_name = "cirrusscan" + "-" + account_id + "-" + region + "-" + vpc_id
-
-    try:
-        scanner_ip = response["Reservations"][0]["Instances"][0]["NetworkInterfaces"][
-            0
-        ]["PrivateIpAddress"]
-        log.info("Scanner name : %s" % scanner_name)
-    except KeyError:
-        log.error("Scanner IP not found")
-        scanner_ip = None
-
-    url = "https://cloud.tenable.com/scanners"
-
-    # Wait for ~30 minutes for the EC2 nessus scanner to get registered with Tenable cloud platform
-    # This is needed to kick off Tenable scans
-    for setup_count in range(30):
-        log.info("Waiting for Tenable Scanner to get registered")
-        time.sleep(60)
-        response = create_tenable_api_request(
-            "wait_for_scanner_registration", "GET", url, headers
-        )
-        scanners = json.loads(response.text)
-
-        for scanner in scanners["scanners"]:
-            if scanner["name"] == scanner_name:
-                scanner_id = scanner["id"]
-                status = scanner["status"]
-                if status == "on":
-                    log.info(
-                        "Scanner: %s is successfully registered with Tenable",
-                        scanner_name,
-                    )
-                    return {"scanner_id": scanner_id, "scanner_ip": scanner_ip}
-
-    log.error("Registration timed out")
-    raise RegistrationTimeoutError
-
-
-def create_scan(headers, scanner_id, vpc_id, targets):
-    """Create a new scan."""
-    log.info("Creating a new scan in Tenable.io")
-
-    # Create a new scan in Tenable with received AWS targets
-    scan_template_uuid = TENABLE_SCAN_TEMPLATE
-
-    region = boto3.session.Session().region_name
-    account_id = boto3.client("sts").get_caller_identity().get("Account")
-    scan_name = account_id + "-" + region + "-" + vpc_id + "-cirrusscan"
-
-    data = {
-        "uuid": scan_template_uuid,
-        "settings": {
-            "name": scan_name,
-            "enabled": True,
-            "policy_id": TENABLE_POLICY_ID,
-            "scanner_id": scanner_id,
-            "text_targets": targets,
-        },
-    }
-
-    payload = json.dumps(data)
-    url = "https://cloud.tenable.com/scans"
-
-    response = create_tenable_api_request(
-        "create_scan", "POST", url, headers, payload=payload
-    )
-    response = json.loads(response.text)
-    scanId = response["scan"]["id"]
-    return scanId
-
-
-def run_scanner(headers, scanId):
-    """Invoke a scan using the Tenable API."""
-    log.info("Scheduling Tenable scanner execution")
-    url = "https://cloud.tenable.com/scans/" + str(scanId) + "/launch"
-
-    create_tenable_api_request("run_scanner", "POST", url, headers)
-
-
-def wait_for_scan_completion(token,registry):
-    """Wait for the scan to be completed"""
-
-    log.info("Waiting for Container Scan to finish")
-    
-    # This loop runs for ~60 minutes, to wait for Prisma scan completion
-    for setup_count in range(60):
-        log.info("Getting Tenable Scan Status")
-        time.sleep(60)
-        
-        offset = 1
-        limit = 50
-        params ={"limit":limit,"offset":offset}
-
-        while True:
-            response = create_prisma_api_request("GET", "registry/progress", token=token, params=params)
-            data = json.loads(response.text)
-           
-            for x in data['registry']:
-                ## registry still being scanned
-                if(x == registry): 
-                    break;
-
-            if len(data) < limit:
-                ## at this point, we have exhaused the list and didnt find the one, meaning it is done.
-                return;    
-            #continue with next page
-            offset += limit     
-
-    log.error("Scanning timed out")
-    raise ScanningTimeoutError
-
-
-def retrieve_scanner_results(headers, scanId):
-    """Retrieve Tenable scanner results."""
-    log.info("Retrieving Tenable scan results")
-
-    # API call to request export from tenable.io
-    url = "https://cloud.tenable.com/scans/" + str(scanId) + "/export"
-
-    payload = {"format": "csv", "chapters": "vuln_by_host"}
-    payload = json.dumps(payload)
-
-    response = create_tenable_api_request(
-        "retrieve_scanner_results", "POST", url, headers, payload=payload
-    )
-    response = json.loads(response.text)
-
-    # API Call to check scan export status
-    file_name = response["file"]
-    url = (
-        "https://cloud.tenable.com/scans/"
-        + str(scanId)
-        + "/export/"
-        + file_name
-        + "/status"
-    )
-
-    # This loop waits for about 10 minutes for the Tenable CSV report export status to go READY
-    for setup_count in range(10):
-        log.info("Waiting for export status to go READY")
-
-        time.sleep(60)
-        response = create_tenable_api_request(
-            "retrieve_scanner_results", "GET", url, headers
-        )
-        response = json.loads(response.text)
-        if response["status"] == "ready":
-            break
-    else:
-        log.error("Error in getting scan export status")
-        raise ScanningTimeoutError
-
-    url = (
-        "https://cloud.tenable.com/scans/"
-        + str(scanId)
-        + "/export/"
-        + file_name
-        + "/download"
-    )
-
-    response = create_tenable_api_request(
-        "retrieve_scanner_results", "GET", url, headers
-    )
-    return response.text
-
-
-def evaluate_scanner_results(handle, csv_results):
-    """Evaluate scanner results and generate Security Hub findings."""
-    log.info("Evaluating Tenable scanner results")
-
-    csv_results = csv.DictReader(csv_results.split("\r\n"), delimiter=",")
-
-    for result in csv_results:
-        if result["Risk"] in ("Low", "Medium", "High"):
-            severity = result.get("Risk", "NONE")
-            title = result.get("Name", "UNKNOWN")
-            description = result.get("Synopsis", "")
-            solution = result.get("Solution", "")
-            url = result.get("See Also", "None").split("\n")[0]
-            host = result.get("Host", "")
-
-            title_id = title.replace(" ", "-")
-
-            # Generate a SecurityHub finding
-            overrides = {}
-            overrides["Id"] = "vulnscan/%s/%s/%s/%s" % (
-                handle.aws_region(),
-                vpc_id,
-                host,
-                title_id,
-            )
-            overrides["Title"] = "Vulnerability Scan [%s, %s]" % (
-                handle.aws_region(),
-                title,
-            )
-            overrides["Description"] = (
-                "The Tenable scanner detected an issue (%s)" % description
-            )
-            overrides["Remediation"] = {"Recommendation": {"Text": solution}}
-            overrides["Resources"] = [
-                {"Type": "AwsEc2Instance", "Id": host, "Region": handle.aws_region()}
-            ]
-
-            overrides["GeneratorId"] = "Vulnerability Scan"
-            overrides["Compliance"] = {"Status": "FAILED"}
-
-            if url != "":
-                overrides["SourceUrl"] = url
-
-            if severity == "High":
-                overrides["Severity"] = common.securityhub.set_severity(
-                    75, original=severity
-                )
-            elif severity == "Medium":
-                overrides["Severity"] = common.securityhub.set_severity(
-                    50, original=severity
-                )
-            elif severity == "Low":
-                overrides["Severity"] = common.securityhub.set_severity(
-                    25, original=severity
-                )
-            try:
-                finding = handle.Finding(overrides["Id"], override_dict=overrides)
-                finding.save()
-            except Exception:
-                log.exception("Error while processing scanner result:")
-
-
-def save_scanner_results(results):
-    """Save scanner results to an S3 bucket."""
-    log.info("Saving Tenable scanner results")
-
-    results_bucket = os.getenv("CIRRUS_SCAN_RESULTS_BUCKET")
-    task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
-    results_key = "vulnscan/%s/results.csv" % task_uuid
-
-    csv_results = csv.reader(results.split("\r\n"), delimiter=",")
-
-    temp_csv = "/tmp/results.csv"
-    vuln_results_csv = open(temp_csv, "w")
-    csv_writer = csv.writer(vuln_results_csv)
-
-    for result in csv_results:
-        csv_row = result
-        csv_writer.writerow(csv_row)
-
-    vuln_results_csv.close()
-    try:
-        s3 = boto3.client("s3")
-        s3.upload_file(temp_csv, results_bucket, results_key)
-    except botocore.exceptions.ClientError:
-        log.exception(
-            "put_object failed for: bucket: %s with key: %s",
-            results_bucket,
-            results_key,
-        )
-
-    if os.path.isfile(temp_csv):
-        os.remove(temp_csv)
-
-
-def deprovision_scanner(provisioned_product_name):
-    """Deprovision a Tenable scanner, using CloudFront, Service Catalog, EC2, etc."""
-    log.info("Deprovisioning Tenable scanner")
-
-    headers = tenable_keys["headers"]
-
-    # Terminate VulnScanner Service Catalog Product from AWS account
-    try:
-        client = boto3.client("servicecatalog")
-        response = client.terminate_provisioned_product(
-            ProvisionedProductName=provisioned_product_name
-        )
-
-        log.info("VulnScanner SC product successfully deleted!")
-
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ResourceNotFoundException":
-            log.info("VulnScanner do not exist! No need to deprovision!")
-        else:
-            log.error("Error in deleting the VulnScanner SC product from AWS account")
-            log.error(e.response["Error"]["Message"])
-
-    # Terminate Scanner from Tenable.io
-    if scanner_details and "scanner_id" in scanner_details:
-        scanner_id = scanner_details["scanner_id"]
-        try:
-            url = "https://cloud.tenable.com/scanners/" + str(scanner_id)
-            response = create_tenable_api_request(
-                "deprovision_scanner", "DELETE", url, headers
-            )
-            log.info("Scanner successfully de-registered from Tenable cloud!")
-        except:
-            log.error("Unable to de-register scanner from Tenable cloud")
 
 
 def generate_informational_finding(handle):
@@ -718,6 +648,7 @@ if __name__ == "__main__":
     scanner = ""
     scanner_details = None
     lock_id = None
+    
 
     try:
        
@@ -726,19 +657,19 @@ if __name__ == "__main__":
         parameters = wrapper.get_parameters()
         # store script parameter in parameter table?
         # sh_parameters = parameters.get("sh_params")
-
+        vpc_id = parameters["vpc_id"]
         region = boto3.session.Session().region_name
         account_id = boto3.client("sts").get_caller_identity().get("Account")
 
-        hasRepo = region_has_repos(region)
+        regionHasRepo = region_has_repos(region)
         
-        # do scan if there's repo
-        if hasRepo:
-        # launch EC2 through service catalog
-        # figure out way to pass in user data
-        # force repo scan
-        # poll repo scan progress
-        # when complete, get repo scan details, use pagination
+        # do scan only when there's repo
+        if regionHasRepo:
+        # launch EC2 through service catalog with user data
+        # - register ECR registry in Prisma with hostname
+        # - force repo scan
+        # - poll repo scan progress
+        # - when complete, get repo scan details, use pagination
         # generate findings for security hub
 
             # Create TenableInstance object
@@ -749,18 +680,15 @@ if __name__ == "__main__":
             # Lock the current task with Tenable instance
             lock_id = instance.lock(os.getenv("CIRRUS_SCAN_TASK_UUID"))
 
-            scanner_details = wait_for_scanner_registration(vpc_id)
+            register_ecr_registry(token,region, account_id, vpc_id)
 
-            scanId = create_scan(
-                tenable_keys["headers"], scanner_details["scanner_id"], vpc_id, targets
-            )
-            run_scanner(tenable_keys["headers"], scanId)
+            force_ecr_registry_scan(token, region, account_id)
+           
+            wait_for_scan_completion(token, region, account_id)
 
-            wait_for_scan_completion(token, registry)
+            results = retrieve_scanner_results(token, region, account_id)
 
-            results = retrieve_scanner_results(tenable_keys["headers"], scanId)
-
-            # save_scanner_results(results)
+            save_scanner_results(results)
 
         context.begin_transaction(
             scope_prefix="containerscan/" + context.aws_region(),
@@ -770,13 +698,9 @@ if __name__ == "__main__":
         if results:
             evaluate_scanner_results(context, results)
 
-        # Stopped EC2 instances are not part of current vulnerability scan. Any previously created
-        # findings for these instances may still be legit and thus will not be auto-archived.
-        do_not_archive_list = get_finding_ids_of_stopped_instances(
-            context, do_not_archive_list
-        )
+       
         generate_informational_finding(context)
-        context.end_transaction(autoarchive=True, dont_archive=do_not_archive_list)
+        context.end_transaction(autoarchive=True, dont_archive=None)
 
         # Pass back finding demographic information. For purposes
         # of this scanner, any finding with a normalized severity

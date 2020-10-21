@@ -1,21 +1,11 @@
 # cirrus-scan-portscan
 
-CirrusScan check: Open Port Scanner
+CirrusScan check: Container Scanner
 
 [CirrusScan](https://github.secureserver.net/appservices/CirrusScan) utilizes
-[masscan](https://github.com/robertdavidgraham/masscan) to identify open ports
-on targeted systems. This scan is performed using a container encapsulating the
-logic required to evaluate the target environments, identify nonconformant ports,
-and forward findings to
+[Prisma Container Defender](https://docs.paloaltonetworks.com/prisma/prisma-cloud/prisma-cloud-admin-compute/install/install_defender/install_single_container_defender.html)to identify compliance violations and vulnerabilities in container images in AWS ECR registries. Findings are forwarded to
 [Security Hub](https://docs.aws.amazon.com/securityhub/latest/userguide/)
 for presentation.
-
-This scanner targets primarily non-AWS hosted environments (such as systems
-located in an on-premise data center). Native AWS environments are more effectively
-inspected using the
-[ScoutSuite scanner](https://github.secureserver.net/appservices/cirrus-scan-scoutsuite),
-which (among other things) evaluates AWS security group configuration instead of
-generating live network traffic to target systems.
 
 Refer to [docker/README.md](docker/README.md) for details on how to construct
 and promote the container used for scanning. Note that all tailoring is
@@ -23,35 +13,7 @@ performed at container build time.
 
 ## Workflow
 
-NOTE: Certain aspects of this description refer to planned future functionality
-which have not been implemented.
-
-Users can trigger vulnerability scans on their own account or on multiple
-accounts, depending on their role and authorization.
-
-A scan request must specify:
-
-* An AWS LOB account. This account will be used to execute the ECS-based
-  CirrusScan scanner instance; the account must be configured for Direct Connect
-  in order to specify a scan source.
-
-* A target. This may consist of one or more IPv4 CIDR specifications, or one or
-  zone names. A zone will be translated into an equivalent list of subnets using
-  CMDB queries performed by the scanner.
-
-A scan request may specify:
-
-* A default port template. The template specifies the set of permitted open ports
-  for systems where the associated template cannot be retrieved from the CMDB
-  (such as when an explicit CIDR target is provided and no CMDB lookup is
-  performed). By default, no open ports are permitted.
-
-* A source. This consists of one or more zone names; when present, the actual
-  scan traffic will originate from an IPv4 address within the specified zone.
-  The default source is `aws`, which means scan traffic will originate from the
-  ECS-based CirrusScan task instance.
-
-When a port scan is requested, the following activities take place:
+When a container scan is requested, the following activities take place:
 
 1. CirrusScan will execute an ECS task in the specified AWS account to
    coordinate the scan.

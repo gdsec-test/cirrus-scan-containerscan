@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
 
 # Deploy scanner instances using this ServiceCatalog offering version
-SC_EC2_VERSION = "1.0.11"
+SC_EC2_VERSION = "2.0.2"
 
 PRISMA_COMPUTE_REST_API_URL = "https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/"
 
@@ -93,7 +93,7 @@ def assume_role(role_arn):
     return creds
 
 
-def getPrismaToken():
+def get_prisma_token():
     """Retrieves Prisma Access key and secret key id from Secret Manager"""
     secret_name = "PrismaAccessKeys"
     region_name = "us-west-2"
@@ -319,8 +319,8 @@ def wait_for_scan_completion(token,region, account_id):
     """Wait for the scan to be completed"""
 
     log.info("Waiting for Container Scan to finish")
-    # sleep for 45 minutes due to lack of progress api
-    time.sleep(45*60)
+    # sleep for 30 minutes due to lack of progress api
+    time.sleep(30*60)
 
     # # This loop runs for ~60 minutes, to wait for Prisma scan completion
     # for setup_count in range(60):
@@ -360,10 +360,10 @@ def retrieve_scanner_results(token, region, account_id):
     response = create_prisma_api_request("GET", "/registry/download", token=token, params=param)
 
     if response.status_code == 200:
-        logging.info("Retrieve scan results from ECR registry %s.", ecr_registry_name )
+        logging.info("Retrieve scan results for ECR registry %s.", ecr_registry_name )
         return response.text
     else:
-        logging.error("Unable to retrieve scan results from ECR registry %s.", ecr_registry_name )
+        logging.error("Unable to retrieve scan results for ECR registry %s.", ecr_registry_name )
 
 
 def evaluate_scanner_results(handle, csv_results):
@@ -461,11 +461,20 @@ def save_scanner_results(results):
         os.remove(temp_csv)
 
 
-def deprovision_scanner(provisioned_product_name):
-    """Deprovision a Tenable scanner, using CloudFront, Service Catalog, EC2, etc."""
-    log.info("Deprovisioning container scanner")
+def provisioned_product_exists(provisioned_product_name):
+    
+    client = boto3.client("servicecatalog")
+    
+    try:
+        response = client.describe_provisioned_product(Name=provisioned_product_name)
+    except client.exceptions.ResourceNotFoundException as e:
+        return False
+    
+    return True
 
-    headers = tenable_keys["headers"]
+def deprovision_scanner(provisioned_product_name):
+    """Deprovision a container scanner"""
+    log.info("Deprovisioning container scanner")
 
     # Terminate VulnScanner Service Catalog Product from AWS account
     try:
@@ -474,29 +483,26 @@ def deprovision_scanner(provisioned_product_name):
             ProvisionedProductName=provisioned_product_name
         )
 
-        log.info("VulnScanner SC product successfully deleted!")
+        log.info("container SC product successfully deleted!")
 
     except ClientError as e:
         if e.response["Error"]["Code"] == "ResourceNotFoundException":
-            log.info("VulnScanner do not exist! No need to deprovision!")
+            log.info("ContainerScanner do not exist! No need to deprovision!")
         else:
             log.error("Error in deleting the VulnScanner SC product from AWS account")
             log.error(e.response["Error"]["Message"])
 
-    # Terminate Scanner from Tenable.io
-    if scanner_details and "scanner_id" in scanner_details:
-        scanner_id = scanner_details["scanner_id"]
-        try:
-            url = "https://cloud.tenable.com/scanners/" + str(scanner_id)
-            response = create_tenable_api_request(
-                "deprovision_scanner", "DELETE", url, headers
-            )
-            log.info("Scanner successfully de-registered from Tenable cloud!")
-        except:
-            log.error("Unable to de-register scanner from Tenable cloud")
+    #wait for deprovisioning to complete
+    for setup_count in range(15):
+        if not provisioned_product_exists(provisioned_product_name):
+            break
+        time.sleep(60)
+    else:
+        log.error("Deprovisioning timed out")        
+        raise DeprovisioningScannerTimeoutError      
+        
 
-
-def provision_scanner(vpc_id):
+def provision_scanner(provisioned_product_name, vpc_id):
     """Provision a Prisma scanner, using Service Catalog product EC2"""
     log.info("Provisioning Tenable scanner")
     client = boto3.client("servicecatalog")
@@ -535,7 +541,7 @@ def provision_scanner(vpc_id):
 
     log.debug("VPC ID: %s", vpc_id)
     log.debug("Subnet Id: %s", subnet_id)
-    provisioned_product_name = "VulnScanner-" + vpc_id
+    # provisioned_product_name = "VulnScanner-" + vpc_id
 
     # Provision VulnScanner Service Catalog Product
     response = client.provision_product(
@@ -652,19 +658,25 @@ if __name__ == "__main__":
 
     try:
        
-        token = getPrismaToken()
-
+        token = get_prisma_token()
+        
         parameters = wrapper.get_parameters()
+        
         # store script parameter in parameter table?
         # sh_parameters = parameters.get("sh_params")
         vpc_id = parameters["vpc_id"]
         region = boto3.session.Session().region_name
         account_id = boto3.client("sts").get_caller_identity().get("Account")
+        provisioned_product_name = "ContainerScanner-" + vpc_id
+
+        productIsProvisioned = provisioned_product_exists(provisioned_product_name)
 
         regionHasRepo = region_has_repos(region)
         
+        # TODO: check provisioned product exists following VulnScan pattern?
+
         # do scan only when there's repo
-        if regionHasRepo:
+        if not productIsProvisioned and regionHasRepo:
         # launch EC2 through service catalog with user data
         # - register ECR registry in Prisma with hostname
         # - force repo scan
@@ -677,6 +689,7 @@ if __name__ == "__main__":
                 vpc_id, provision_scanner, deprovision_scanner
             )
 
+            
             # Lock the current task with Tenable instance
             lock_id = instance.lock(os.getenv("CIRRUS_SCAN_TASK_UUID"))
 

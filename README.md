@@ -1,4 +1,4 @@
-# cirrus-scan-portscan
+# cirrus-scan-containerscan
 
 CirrusScan check: Container Scanner
 

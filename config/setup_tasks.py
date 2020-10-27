@@ -9,7 +9,7 @@ def main():
     audit_account_id = sts.get_caller_identity()["Account"]
 
     # ECR that holds this container
-    task_image = "%s.dkr.ecr.us-west-2.amazonaws.com/prismascan" % audit_account_id
+    task_image = "%s.dkr.ecr.us-west-2.amazonaws.com/containerscan" % audit_account_id
 
     # Configuration parameters used by wrapper.py
     dynamodb = boto3.resource("dynamodb")
@@ -18,7 +18,7 @@ def main():
    
     # Default task configuration
     task_config = {
-        "TASK_NAME": "prismascan",
+        "TASK_NAME": "containerscan",
         "TASK_SCOPE": "REGION",
         "TASK_CPU": "1024",
         "TASK_MEMORY": "2048",
@@ -31,7 +31,7 @@ def main():
     task = dynamodb.Table("task")
 
     task.put_item(
-        Item={"key": "prismascan", "value": task_config}
+        Item={"key": "containerscan", "value": task_config}
     )
 
 

@@ -427,7 +427,6 @@ def evaluate_scanner_results(handle, csv_results):
             except Exception:
                 log.exception("Error while processing scanner result:")
 
-
 def save_scanner_results(results):
     """Save scanner results to an S3 bucket."""
     log.info("Saving Tenable scanner results")
@@ -459,7 +458,6 @@ def save_scanner_results(results):
 
     if os.path.isfile(temp_csv):
         os.remove(temp_csv)
-
 
 def provisioned_product_exists(provisioned_product_name):
     
@@ -501,7 +499,6 @@ def deprovision_scanner(provisioned_product_name):
         log.error("Deprovisioning timed out")        
         raise DeprovisioningScannerTimeoutError      
         
-
 def provision_scanner(provisioned_product_name, vpc_id):
     """Provision a Prisma scanner, using Service Catalog product EC2"""
     log.info("Provisioning Tenable scanner")
@@ -572,7 +569,6 @@ def provision_scanner(provisioned_product_name, vpc_id):
         raise ProvisioningTimeoutError
     return provisioned_product_name
 
-
 def generate_informational_finding(handle):
     """Generate an informational finding indicating test is complete"""
 
@@ -603,40 +599,259 @@ def generate_informational_finding(handle):
 
     finding.save()
 
+ def update_ssm_state_parameter(self, value):
+        """Update shared instance state in Parameter Store"""
 
-def get_finding_ids_of_stopped_instances(handle, do_not_archive):
-    """Get regular expression for all stopped instances"""
+        self.ssm.put_parameter(
+            Name=self.state_parameter, Value=value, Overwrite=True,
+        )
 
-    client = boto3.client("ec2")
-    running_instances = client.describe_instances(
-        Filters=[{"Name": "instance-state-name", "Values": ["stopped"]}]
-    )
+        log.debug("Updated %s: %s", self.state_parameter, value)
+        return value
 
-    for reservation in running_instances["Reservations"]:
-        for instance in reservation["Instances"]:
-            for networkInterface in instance["NetworkInterfaces"]:
-                do_not_archive_reg_expression = create_do_not_archive_expression(
-                    handle, networkInterface["PrivateIpAddress"]
-                )
+    def get_ssm_state_parameter(self):
+        """Obtain current shared instance state from Parameter Store"""
 
-                do_not_archive.append(do_not_archive_reg_expression)
+        try:
 
-    log.info("Do not archive list: %s", do_not_archive)
+            response = self.ssm.get_parameter(Name=self.state_parameter)
 
-    if not do_not_archive:
-        log.debug("No stopped instances in this account!!!")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ParameterNotFound":
+                log.debug("%s : Not found", self.state_parameter)
+                return None
+            raise
 
-    return do_not_archive
+        if not response["Parameter"]:
+            return None
 
+        log.debug("%s : %s", self.state_parameter, response["Parameter"]["Value"])
+        return response["Parameter"]["Value"]
 
-def create_do_not_archive_expression(handle, ip_address):
-    """Returns a regular expression to identify all the findings for a given IP address"""
+    # High-level locking methods used by caller; these should be the only two
+    # public methods (other than the constructor itself).
 
-    reg_expression = (
-        r"^vulnscan/" + handle.aws_region() + "/" + vpc_id + "/" + ip_address + "/"
-    )
-    return reg_expression
+    def lock(self, task_uuid):
+        """Register interest in shared tenable scanner instance, possibly creating it"""
+        # creates task parameter
+        self.create_ssm_task_parameter(task_uuid)
 
+        # transition to operational state; this either succeeds or raises an
+        # exception (which we do not attempt to catch), so we unconditionally
+        # return the UUID.
+        self.state_change("OPERATIONAL")
+        return task_uuid
+
+    def unlock(self, task_uuid):
+        """Release shared tenable scanner instance, possibly deprovisioning it"""
+
+        self.delete_ssm_task_parameter(task_uuid)
+
+        # check if any other task in the VPC is using VulnScanner
+        if self.is_any_task_running():
+            log.debug("More scans in progress. Not terminating VulnScanner")
+            return
+
+        # Terminate VulnScanner
+        log.debug("Terminating VulnScanner!")
+        self.state_change("DEPROVISIONING")
+
+    # Low-level routines used for marking locks using Parameter Store, where
+    # they are visible to cooperating processes.
+
+    def create_ssm_task_parameter(self, task_uuid):
+        """Create persistent lock marker in Parameter Store"""
+
+        expiration_time = datetime.datetime.now() + self.timeout
+
+        name = self.task_state_path + task_uuid
+
+        self.ssm.put_parameter(
+            Name=name,
+            Description="Vulnerability Scan Active Task",
+            Value=str(expiration_time),
+            Type="String",
+            Tier="Standard",
+        )
+
+        log.debug("SSM task parameter created: %s", name)
+
+    def delete_ssm_task_parameter(self, task_uuid):
+        """Remove persistent lock marker in Parameter Store"""
+
+        name = self.task_state_path + task_uuid
+
+        self.ssm.delete_parameter(Name=name)
+
+        log.debug("SSM task parameter deleted: %s", name)
+
+    def is_any_task_running(self):
+        """Returns True if unexpired lock markers exist in Parameter Store"""
+
+        response = self.ssm.get_parameters_by_path(
+            Path=self.task_state_path[:-1], Recursive=True
+        )
+        log.debug("Check if any more scans in progress.")
+        # check if Response is empty
+        if not response["Parameters"]:
+            return False
+        else:
+            for parameter in response["Parameters"]:
+                expiration_time = parameter["Value"]
+                if str(datetime.datetime.now()) < str(expiration_time):
+                    log.debug("is_vulnerability_scan_task_running? : YES")
+                    return True
+
+        log.debug("is_vulnerability_scan_task_running? : NO")
+        return False
+
+ def update_ssm_state_parameter(self, value):
+        """Update shared instance state in Parameter Store"""
+
+        self.ssm.put_parameter(
+            Name=self.state_parameter, Value=value, Overwrite=True,
+        )
+
+        log.debug("Updated %s: %s", self.state_parameter, value)
+        return value
+
+    def get_ssm_state_parameter(self):
+        """Obtain current shared instance state from Parameter Store"""
+
+        try:
+
+            response = self.ssm.get_parameter(Name=self.state_parameter)
+
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ParameterNotFound":
+                log.debug("%s : Not found", self.state_parameter)
+                return None
+            raise
+
+        if not response["Parameter"]:
+            return None
+
+        log.debug("%s : %s", self.state_parameter, response["Parameter"]["Value"])
+        return response["Parameter"]["Value"]
+
+    # High-level locking methods used by caller; these should be the only two
+    # public methods (other than the constructor itself).
+
+    def lock(self, task_uuid):
+        """Register interest in shared tenable scanner instance, possibly creating it"""
+        # creates task parameter
+        self.create_ssm_task_parameter(task_uuid)
+
+        # transition to operational state; this either succeeds or raises an
+        # exception (which we do not attempt to catch), so we unconditionally
+        # return the UUID.
+        self.state_change("OPERATIONAL")
+        return task_uuid
+
+    def unlock(self, task_uuid):
+        """Release shared tenable scanner instance, possibly deprovisioning it"""
+
+        self.delete_ssm_task_parameter(task_uuid)
+
+        # check if any other task in the VPC is using VulnScanner
+        if self.is_any_task_running():
+            log.debug("More scans in progress. Not terminating VulnScanner")
+            return
+
+        # Terminate VulnScanner
+        log.debug("Terminating VulnScanner!")
+        self.state_change("DEPROVISIONING")
+
+    # Low-level routines used for marking locks using Parameter Store, where
+    # they are visible to cooperating processes.
+
+    def create_ssm_task_parameter(self, task_uuid):
+        """Create persistent lock marker in Parameter Store"""
+
+        expiration_time = datetime.datetime.now() + self.timeout
+
+        name = self.task_state_path + task_uuid
+
+        self.ssm.put_parameter(
+            Name=name,
+            Description="Vulnerability Scan Active Task",
+            Value=str(expiration_time),
+            Type="String",
+            Tier="Standard",
+        )
+
+        log.debug("SSM task parameter created: %s", name)
+
+    def delete_ssm_task_parameter(self, task_uuid):
+        """Remove persistent lock marker in Parameter Store"""
+
+        name = self.task_state_path + task_uuid
+
+        self.ssm.delete_parameter(Name=name)
+
+        log.debug("SSM task parameter deleted: %s", name)
+
+    def is_any_task_running(self):
+        """Returns True if unexpired lock markers exist in Parameter Store"""
+
+        response = self.ssm.get_parameters_by_path(
+            Path=self.task_state_path[:-1], Recursive=True
+        )
+        log.debug("Check if any more scans in progress.")
+        # check if Response is empty
+        if not response["Parameters"]:
+            return False
+        else:
+            for parameter in response["Parameters"]:
+                expiration_time = parameter["Value"]
+                if str(datetime.datetime.now()) < str(expiration_time):
+                    log.debug("is_vulnerability_scan_task_running? : YES")
+                    return True
+
+        log.debug("is_vulnerability_scan_task_running? : NO")
+        return False
+
+def create_ssm_task_parameter(ssm, task_name):
+        """Create persistent lock marker in Parameter Store"""
+
+        expiration_time = datetime.datetime.now() + datetime.timedelta(hours=1)
+        
+        ssm.put_parameter(
+            Name=task_name,
+            Description="Container Scan Active Task",
+            Value=str(expiration_time),
+            Type="String",
+            Tier="Standard",
+            Overwrite=True,
+        )
+
+        log.debug("SSM task parameter created: %s", task_name)
+
+def delete_ssm_task_parameter(ssm, task_name):
+        """Remove persistent lock marker in Parameter Store"""
+       
+        ssm.delete_parameter(Name=task_name)
+
+        log.debug("SSM task parameter deleted: %s", task_name)
+
+def get_ssm_task_parameter(ssm, task_name):
+        """Obtain task parameter from Parameter Store"""
+
+        try:
+
+            response = ssm.get_parameter(Name=task_name)
+
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ParameterNotFound":
+                log.debug("%s : Not found", task_name)
+                return None
+            raise
+
+        if not response["Parameter"]:
+            return None
+
+        log.debug("%s : %s", task_name, response["Parameter"]["Value"])
+        return response["Parameter"]["Value"]
 
 if __name__ == "__main__":
     # Adjust log format if running on a terminal
@@ -659,9 +874,8 @@ if __name__ == "__main__":
     try:
        
         token = get_prisma_token()
-        
         parameters = wrapper.get_parameters()
-        
+        task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
         # store script parameter in parameter table?
         # sh_parameters = parameters.get("sh_params")
         vpc_id = parameters["vpc_id"]
@@ -669,22 +883,27 @@ if __name__ == "__main__":
         account_id = boto3.client("sts").get_caller_identity().get("Account")
         provisioned_product_name = "ContainerScanner-" + vpc_id
 
-        productIsProvisioned = provisioned_product_exists(provisioned_product_name)
+        # isProvisioned = provisioned_product_exists(provisioned_product_name)
 
         regionHasRepo = region_has_repos(region)
         
-        # TODO: check provisioned product exists following VulnScan pattern?
-
+        ssm = boto3.client("ssm")
+        task_name = "/CirrusScan/containerscan/" + vpc_id + "/users/" + task_uuid 
+        isProvisioned = False if get_ssm_task_parameter(ssm, task_name) is None else True
+    
         # do scan only when there's repo
-        if not productIsProvisioned and regionHasRepo:
+        if not isProvisioned and regionHasRepo:
         # launch EC2 through service catalog with user data
         # - register ECR registry in Prisma with hostname
         # - force repo scan
         # - poll repo scan progress
         # - when complete, get repo scan details, use pagination
         # generate findings for security hub
+            # add state parameter
+            
+            create_ssm_task_parameter(ssm, task_name)
+        
 
-            # Create TenableInstance object
             instance = tenable_instance.TenableInstance(
                 vpc_id, provision_scanner, deprovision_scanner
             )
@@ -727,12 +946,13 @@ if __name__ == "__main__":
         wrapper.put_status(
             {"status": "SUCCESS", "compliance": compliance, "finding_data": scan_info}
         )
+       
+        deprovision_scanner(provisioned_product_name)
+        delete_ssm_task_parameter(ssm, task_name)
+
     except ExitContainerScanner:
         log.info("Exiting Container scanner!")
     except:
         log.exception("Error while executing vulnerability scanner")
-    finally:
-        if lock_id:
-            instance.unlock(lock_id)
-        else:
-            log.info("No resources to terminate. VulnScanner exiting!")
+    
+        

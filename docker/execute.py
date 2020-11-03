@@ -599,7 +599,7 @@ def generate_informational_finding(handle):
 
     finding.save()
 
- def create_ssm_task_parameter(ssm, task_name):
+def create_ssm_task_parameter(ssm, task_name):
         """Create persistent lock marker in Parameter Store"""
 
         expiration_time = datetime.datetime.now() + datetime.timedelta(hours=1)
@@ -672,32 +672,7 @@ def get_ssm_task_parameter(ssm, task_name):
     # Low-level routines used for marking locks using Parameter Store, where
     # they are visible to cooperating processes.
 
-    def create_ssm_task_parameter(self, task_uuid):
-        """Create persistent lock marker in Parameter Store"""
-
-        expiration_time = datetime.datetime.now() + self.timeout
-
-        name = self.task_state_path + task_uuid
-
-        self.ssm.put_parameter(
-            Name=name,
-            Description="Vulnerability Scan Active Task",
-            Value=str(expiration_time),
-            Type="String",
-            Tier="Standard",
-        )
-
-        log.debug("SSM task parameter created: %s", name)
-
-    def delete_ssm_task_parameter(self, task_uuid):
-        """Remove persistent lock marker in Parameter Store"""
-
-        name = self.task_state_path + task_uuid
-
-        self.ssm.delete_parameter(Name=name)
-
-        log.debug("SSM task parameter deleted: %s", name)
-
+    
     def is_any_task_running(self):
         """Returns True if unexpired lock markers exist in Parameter Store"""
 
@@ -718,38 +693,7 @@ def get_ssm_task_parameter(ssm, task_name):
         log.debug("is_vulnerability_scan_task_running? : NO")
         return False
 
- def update_ssm_state_parameter(self, value):
-        """Update shared instance state in Parameter Store"""
-
-        self.ssm.put_parameter(
-            Name=self.state_parameter, Value=value, Overwrite=True,
-        )
-
-        log.debug("Updated %s: %s", self.state_parameter, value)
-        return value
-
-    def get_ssm_state_parameter(self):
-        """Obtain current shared instance state from Parameter Store"""
-
-        try:
-
-            response = self.ssm.get_parameter(Name=self.state_parameter)
-
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ParameterNotFound":
-                log.debug("%s : Not found", self.state_parameter)
-                return None
-            raise
-
-        if not response["Parameter"]:
-            return None
-
-        log.debug("%s : %s", self.state_parameter, response["Parameter"]["Value"])
-        return response["Parameter"]["Value"]
-
-    # High-level locking methods used by caller; these should be the only two
-    # public methods (other than the constructor itself).
-
+ 
     def lock(self, task_uuid):
         """Register interest in shared tenable scanner instance, possibly creating it"""
         # creates task parameter

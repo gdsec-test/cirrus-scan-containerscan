@@ -16,16 +16,13 @@ from botocore.exceptions import ClientError
 from requests.packages.urllib3.util.retry import Retry
 import common.securityhub
 import wrapper
-from .aws_clients import SecurityTokenServiceClient, EC2Client, ServiceCatalog, ECRClient
-from .prisma import Scanner
+from .aws_clients import SecurityTokenServiceClient, EC2Client, ServiceCatalog, ECRClient, SSMClient
+from .prisma import Scanner, Prisma
 from .errors import ExitContainerScanner
 from .utils import initialize_logging
 
-log = logging.getLogger(__name__)
-log.setLevel(logging.DEBUG)
-
-PRISMA_COMPUTE_REST_API_URL = "https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/"
-
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # TODO: add function to security hub class
 def initialize_security_hub():
@@ -74,22 +71,24 @@ if __name__ == "__main__":
     lock_id = None
 
     try:
+        parameters = wrapper.get_parameters()
+        vpc_id = parameters["vpc_id"]
+
+        prisma = Prisma(logger)
         prisma_scanner = Scanner(logger)
         sts_client = SecurityTokenServiceClient(logger)
         ssm_client = SSMClient(logger)
 
         region = boto3.session.Session().region_name
         ecr_client = ECRClient(region)
-
-        # TODO: determine if we still need token. If so, create this getPrismaToken
-        token = getPrismaToken()
-        vpc_id = get_vpc_id()
+        
+        token = prisma.get_token()
 
         account_id = sts_client.get_account_id()
 
         task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
-        task_name = "/CirrusScan/containerscan/" + vpc_id + "/users/" + task_uuid
-        isProvisioned = ssm_client.get_ssm_task_parameter(
+        task_name = "/CirrusScan/containerscan/" + vpc_id + "/" + task_uuid
+        isProvisioned = ssm_client.get_task_parameter(
             task_name) is not None
         provisioned_product_name = "ContainerScanner-" + vpc_id
 
@@ -102,8 +101,9 @@ if __name__ == "__main__":
             # - when complete, get repo scan details, use pagination
             # generate findings for security hub
 
-            ssm_client.create_ssm_task_parameter(task_name)
-            # TODO: launch specialized EC2 instance
+            ssm_client.create_task_parameter(task_name)
+            
+            prisma_scanner.provision_scanner(provisioned_product_name, vpc_id)
 
             ecr_registry_name = account_id + ".dkr.ecr." + region + ".amazonaws.com"
 
@@ -119,36 +119,35 @@ if __name__ == "__main__":
 
             prisma_scanner.save_scanner_results(results)
 
-        security_hub_context.begin_transaction(
-            scope_prefix="containerscan/" + context.aws_region(),
-            scope_region=context.aws_region(),
-        )
+            security_hub_context.begin_transaction(
+                scope_prefix="containerscan/" + security_hub_context.aws_region(),
+                scope_region=security_hub_context.aws_region(),
+            )
 
-        if results is not None:
-            prisma_scanner.evaluate_scanner_results(
-                vpc_id, security_hub_context, results)
+            if results is not None:
+                prisma_scanner.evaluate_scanner_results(
+                    vpc_id, security_hub_context, results)
 
-        generate_informational_finding(security_hub_context)
-        security_hub_context.end_transaction(
-            autoarchive=True, dont_archive=None)
+            generate_informational_finding(security_hub_context)
+            security_hub_context.end_transaction(
+                autoarchive=True, dont_archive=None)
 
-        # Pass back finding demographic information. For purposes
-        # of this scanner, any finding with a normalized severity
-        # of at least 70 constitutes a compliance failure.
-        scan_info = security_hub_context.get_finding_data()
-        compliance = "PASS"
-        for severity in scan_info["severity"]:
-            if severity >= 70:
-                compliance = "FAIL"
-                break
-        wrapper.put_status(
-            {"status": "SUCCESS", "compliance": compliance, "finding_data": scan_info}
-        )
+            # Pass back finding demographic information. For purposes
+            # of this scanner, any finding with a normalized severity
+            # of at least 70 constitutes a compliance failure.
+            scan_info = security_hub_context.get_finding_data()
+            compliance = "PASS"
+            for severity in scan_info["severity"]:
+                if severity >= 70:
+                    compliance = "FAIL"
+                    break
+            wrapper.put_status(
+                {"status": "SUCCESS", "compliance": compliance, "finding_data": scan_info}
+            )
 
-        deprovision_scanner(provisioned_product_name)
-        ssm_client.delete_ssm_task_parameter(task_name)
-
+            prisma_scanner.deprovision_scanner(provisioned_product_name)
+            ssm_client.delete_task_parameter(task_name)
     except ExitContainerScanner:
-        log.info("Exiting Container scanner!")
+        logger.info("Exiting Container scanner!")
     except:
-        log.exception("Error while executing vulnerability scanner")
+        logger.exception("Error while executing vulnerability scanner")

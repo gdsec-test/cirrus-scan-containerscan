@@ -4,7 +4,7 @@ import csv
 from time import sleep
 from requests.packages.urllib3.util.retry import Retry
 import common.securityhub
-from .errors import SecretManagerRetrievalError, ExitContainerScanner, ForceScanError, RegistrationError, ProvisioningTimeoutError
+from .errors import SecretManagerRetrievalError, ExitContainerScanner, ForceScanError, RegistrationError, ProvisioningTimeoutError,DeprovisioningScannerTimeoutError
 from .aws_clients import SecurityTokenServiceClient, SecretsManagerClient, EC2Client, S3Client, ServiceCatalog
 from .utils import load_in_script
 
@@ -104,7 +104,7 @@ class Prisma():
     # TODO(lmcdade): Do we expect token to ever be empty
     def create_prisma_api_request(self, method, url, token=None, payload=None, params=None):
         """Helper function to make Prisma API requests"""
-
+        
         # As we may hit Prisma API limits, try hitting Prisma at least 3 times before shutting down Vulnerability Scanner
         retries = Retry(
             total=3,
@@ -360,7 +360,7 @@ class Scanner():
                     self.logger.exception(
                         "Error while processing scanner result:")
 
-    def provision_scanner(self, vpc_id):
+    def provision_scanner(self,provisioned_product_name,vpc_id):
         """Provision a Prisma scanner, using Service Catalog product EC2"""
         self.logger.info("Provisioning Prisma scanner")
 
@@ -371,8 +371,7 @@ class Scanner():
         provisioning_artifact_id = ec2_client.get_ec2_product_description(
             product_id)
 
-        script = load_in_script()
-        provisioned_product_name = "VulnScanner-" + vpc_id
+        script = load_in_script()        
         provisioned_product_id = ec2_client.provision_ec2(
             provisioned_product_name,
             product_id,
@@ -403,3 +402,11 @@ class Scanner():
         # Terminate VulnScanner Service Catalog Product from AWS account
         sc_client = ServiceCatalog(self.logger)
         sc_client.terminate_provisioned_product(provisioned_product_name)
+         #wait for deprovisioning to complete
+        for setup_count in range(15):
+            if not provisioned_product_exists(provisioned_product_name):
+                break
+            time.sleep(60)
+        else:
+            self.logger.error("Deprovisioning timed out")        
+            raise DeprovisioningScannerTimeoutError   

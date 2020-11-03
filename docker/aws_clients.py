@@ -274,7 +274,7 @@ class SSMClient():
 
         self.logger.debug("SSM task parameter created: %s", task_name)
 
-    def get_ssm_task_parameter(self, task_name):
+    def get_task_parameter(self, task_name):
         """Obtain task parameter from Parameter Store"""
 
         try:
@@ -291,16 +291,6 @@ class SSMClient():
 
         self.logger.debug("%s : %s", task_name, response["Parameter"]["Value"])
         return response["Parameter"]["Value"]
-
-    def update_ssm_state_parameter(self, value):
-        """Update shared instance state in Parameter Store"""
-        # TODO: find missing state_parameter (ask Victoria?)
-        self.client.put_parameter(
-            Name=self.state_parameter, Value=value, Overwrite=True,
-        )
-
-        self.logger.debug("Updated %s: %s", self.state_parameter, value)
-        return value
 
     def delete_task_parameter(self, task_name):
         """Remove persistent lock marker in Parameter Store"""

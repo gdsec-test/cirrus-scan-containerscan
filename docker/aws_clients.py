@@ -12,6 +12,8 @@ ROLE_SESSION_NAME = "cirrus-scan"
 
 
 class SecurityTokenServiceClient():
+    """AWS STS Client to fetch AWS Credentials based on Role"""
+
     def __init__(self, logger):
         self.client = boto3.client("sts")
         self.logger = logger

@@ -7,15 +7,15 @@ import boto3
 from . import wrapper
 from .common import securityhub
 from .aws_clients import SecurityTokenServiceClient, EC2Client, ServiceCatalog, ECRClient, SSMClient
-from .prisma import Scanner, Prisma
-from .errors import ExitContainerScanner
-from .utils import initialize_logging
+from .prisma import Scanner, PrismaClient
+from .errors import SecretManagerRetrievalError, ExitContainerScanner
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+CIRRUS_SCAN_BUCKET_ENV_NAME = "CIRRUS_SCAN_RESULTS_BUCKET"
 
-# TODO: add function to security hub class
+
 def generate_informational_finding(handle):
     """Generate an informational finding indicating test is complete"""
 
@@ -48,29 +48,73 @@ def generate_informational_finding(handle):
     finding.save()
 
 
+def get_accounts_bucket():
+    """Get the global audit accounts bucket"""
+    accounts_bucket = os.getenv(CIRRUS_SCAN_BUCKET_ENV_NAME)
+    if not accounts_bucket:
+        logger.error(
+            "Error in retrieving Global Account bucket details. Exiting!")
+        raise SecretManagerRetrievalError
+
+    return accounts_bucket
+
+
+def get_audit_role_arn(accounts_bucket):
+    """Get audit role ARN based on an account bucket"""
+    auditRoleArn = None
+
+    if "dev-private" in accounts_bucket:
+        auditRoleArn = "arn:aws:iam::878238275157:role/GDAuditFrameworkContainerScanRole"
+    elif "gd-audit-prod-cirrus-scan-results-p" in accounts_bucket:
+        auditRoleArn = "arn:aws:iam::339078146124:role/GDAuditFrameworkContainerScanRole"
+    elif "gd-audit-prod-cirrus-scan-results-h" in accounts_bucket:
+        auditRoleArn = "arn:aws:iam::512827982966:role/GDAuditFrameworkContainerScanRole"
+    elif "gd-audit-prod-cirrus-scan-results-r" in accounts_bucket:
+        auditRoleArn = "arn:aws:iam::906957162968:role/GDAuditFrameworkContainerScanRole"
+    elif "gd-audit-prod-cirrus-scan-results" in accounts_bucket:
+        auditRoleArn = "arn:aws:iam::672751022979:role/GDAuditFrameworkContainerScanRole"
+
+    if auditRoleArn is None:
+        logger.error("Error in retrieving auditRoleArn. Exiting!")
+        raise SecretManagerRetrievalError
+
+    logger.info("AuditRoleARN: %s", auditRoleArn)
+
+    return auditRoleArn
+
+
+def init_logger():
+    """Initialize logger instance"""
+    logging.basicConfig(
+        level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+
+    logging.getLogger("botocore").setLevel(logging.WARNING)
+    logging.getLogger("boto3").setLevel(logging.INFO)
+    logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
+
 if __name__ == "__main__":
-    initialize_logging()
+    init_logger()
 
     exception_rules = wrapper.get_exception_rules()
-    security_hub_context = securityhub.SecurityHub_Manager(
+    security_hub_mgr = securityhub.SecurityHub_Manager(
         exception_rules=exception_rules)
-
-    results = None
-    lock_id = None
+    parameters = wrapper.get_parameters()
+    vpc_id = parameters["vpc_id"]
 
     try:
-        parameters = wrapper.get_parameters()
-        vpc_id = parameters["vpc_id"]
-
-        prisma = Prisma(logger)
-        prisma_scanner = Scanner(logger)
+        results = None
+        region = boto3.session.Session().region_name
         sts_client = SecurityTokenServiceClient(logger)
         ssm_client = SSMClient(logger)
-
-        region = boto3.session.Session().region_name
         ecr_client = ECRClient(region)
+        prisma_client = PrismaClient(logger)
+        prisma_scanner = Scanner(logger)
 
-        token = prisma.get_token()
+        audit_role_arn = get_audit_role_arn(get_accounts_bucket())
+
+        token = prisma_client.get_token(audit_role_arn)
 
         account_id = sts_client.get_account_id()
 
@@ -107,23 +151,23 @@ if __name__ == "__main__":
 
             prisma_scanner.save_scanner_results(results)
 
-            security_hub_context.begin_transaction(
-                scope_prefix="containerscan/" + security_hub_context.aws_region(),
-                scope_region=security_hub_context.aws_region(),
+            security_hub_mgr.begin_transaction(
+                scope_prefix="containerscan/" + security_hub_mgr.aws_region(),
+                scope_region=security_hub_mgr.aws_region(),
             )
 
             if results is not None:
                 prisma_scanner.evaluate_scanner_results(
-                    vpc_id, security_hub_context, results)
+                    vpc_id, security_hub_mgr, results)
 
-            generate_informational_finding(security_hub_context)
-            security_hub_context.end_transaction(
+            generate_informational_finding(security_hub_mgr)
+            security_hub_mgr.end_transaction(
                 autoarchive=True, dont_archive=None)
 
             # Pass back finding demographic information. For purposes
             # of this scanner, any finding with a normalized severity
             # of at least 70 constitutes a compliance failure.
-            scan_info = security_hub_context.get_finding_data()
+            scan_info = security_hub_mgr.get_finding_data()
             compliance = "PASS"
             for severity in scan_info["severity"]:
                 if severity >= 70:

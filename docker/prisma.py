@@ -1,35 +1,18 @@
-import os
 import json
 import csv
 import requests
 from time import sleep
 from requests.packages.urllib3.util.retry import Retry
 import common.securityhub
-from .errors import SecretManagerRetrievalError, ExitContainerScanner, ForceScanError, RegistrationError, ProvisioningTimeoutError,DeprovisioningScannerTimeoutError
+from .errors import SecretManagerRetrievalError, ExitContainerScanner, ForceScanError, RegistrationError, ProvisioningTimeoutError, DeprovisioningScannerTimeoutError
 from .aws_clients import SecurityTokenServiceClient, SecretsManagerClient, EC2Client, S3Client, ServiceCatalog
 from .utils import load_in_script
 
-CIRRUS_SCAN_BUCKET_ENV_NAME = "CIRRUS_SCAN_RESULTS_BUCKET"
 
-
-class Prisma():
+class PrismaClient():
     def __init__(self, logger):
         self.sts_client = SecurityTokenServiceClient(logger)
         self.logger = logger
-
-    @staticmethod
-    def determine_audit_role_arn(accounts_bucket):
-        if "dev-private" in accounts_bucket:
-            return "arn:aws:iam::878238275157:role/GDAuditFrameworkContainerScanRole"
-        elif "gd-audit-prod-cirrus-scan-results-p" in accounts_bucket:
-            return "arn:aws:iam::339078146124:role/GDAuditFrameworkContainerScanRole"
-        elif "gd-audit-prod-cirrus-scan-results-h" in accounts_bucket:
-            return "arn:aws:iam::512827982966:role/GDAuditFrameworkContainerScanRole"
-        elif "gd-audit-prod-cirrus-scan-results-r" in accounts_bucket:
-            return "arn:aws:iam::906957162968:role/GDAuditFrameworkContainerScanRole"
-        elif "gd-audit-prod-cirrus-scan-results" in accounts_bucket:
-            return "arn:aws:iam::672751022979:role/GDAuditFrameworkContainerScanRole"
-        return None
 
     @staticmethod
     def create_prisma_auth(prisma_secrets):
@@ -40,11 +23,8 @@ class Prisma():
         prisma_auth = json.dumps(auth_dict)
         return prisma_auth
 
-    def get_token(self):
+    def get_token(self, audit_role_arn):
         """Retrieves Prisma Access key and secret key id from Secret Manager"""
-
-        accounts_bucket = self.get_accounts_bucket()
-        audit_role_arn = self.get_audit_role_arn(accounts_bucket)
         screts_mananger_creds = self.get_screts_mananger_creds(audit_role_arn)
         prisma_secrets = self.get_prisma_token_secrets(screts_mananger_creds)
         prisma_auth = self.create_prisma_auth(prisma_secrets)
@@ -61,27 +41,6 @@ class Prisma():
         text_json = json.loads(response.text)
         token = text_json["token"]
         return token
-
-    def get_accounts_bucket(self):
-        # Get the global audit account
-        accounts_bucket = os.getenv(CIRRUS_SCAN_BUCKET_ENV_NAME)
-        if not accounts_bucket:
-            self.logger.error(
-                "Error in retrieving Global Account bucket details. Exiting!")
-            raise SecretManagerRetrievalError
-
-        return accounts_bucket
-
-    def get_audit_role_arn(self, accounts_bucket):
-        auditRoleArn = self.determine_audit_role_arn(accounts_bucket)
-        if auditRoleArn is None:
-            self.logger.error(
-                "Error in retrieving auditRoleArn. Exiting!")
-            raise SecretManagerRetrievalError
-
-        self.logger.info("AuditRoleARN: %s", auditRoleArn)
-
-        return auditRoleArn
 
     def get_screts_mananger_creds(self, audit_role_arn):
         # Get API keys from Global Audit account
@@ -362,7 +321,7 @@ class Scanner():
                     self.logger.exception(
                         "Error while processing scanner result:")
 
-    def provision_scanner(self,provisioned_product_name,vpc_id):
+    def provision_scanner(self, provisioned_product_name, vpc_id):
         """Provision a Prisma scanner, using Service Catalog product EC2"""
         self.logger.info("Provisioning Prisma scanner")
 
@@ -373,7 +332,7 @@ class Scanner():
         provisioning_artifact_id = ec2_client.get_ec2_product_description(
             product_id)
 
-        script = load_in_script()        
+        script = load_in_script()
         provisioned_product_id = ec2_client.provision_ec2(
             provisioned_product_name,
             product_id,
@@ -404,11 +363,11 @@ class Scanner():
         # Terminate VulnScanner Service Catalog Product from AWS account
         sc_client = ServiceCatalog(self.logger)
         sc_client.terminate_provisioned_product(provisioned_product_name)
-         #wait for deprovisioning to complete
+        # wait for deprovisioning to complete
         for setup_count in range(15):
             if not provisioned_product_exists(provisioned_product_name):
                 break
             time.sleep(60)
         else:
-            self.logger.error("Deprovisioning timed out")        
-            raise DeprovisioningScannerTimeoutError   
+            self.logger.error("Deprovisioning timed out")
+            raise DeprovisioningScannerTimeoutError

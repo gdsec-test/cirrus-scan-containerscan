@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+import requests
 from time import sleep
 from requests.packages.urllib3.util.retry import Retry
 import common.securityhub
@@ -19,22 +20,22 @@ class Prisma():
     @staticmethod
     def determine_audit_role_arn(accounts_bucket):
         if "dev-private" in accounts_bucket:
-            return "arn:aws:iam::878238275157:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+            return "arn:aws:iam::878238275157:role/GDAuditFrameworkContainerScanRole"
         elif "gd-audit-prod-cirrus-scan-results-p" in accounts_bucket:
-            return "arn:aws:iam::339078146124:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+            return "arn:aws:iam::339078146124:role/GDAuditFrameworkContainerScanRole"
         elif "gd-audit-prod-cirrus-scan-results-h" in accounts_bucket:
-            return "arn:aws:iam::512827982966:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+            return "arn:aws:iam::512827982966:role/GDAuditFrameworkContainerScanRole"
         elif "gd-audit-prod-cirrus-scan-results-r" in accounts_bucket:
-            return "arn:aws:iam::906957162968:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+            return "arn:aws:iam::906957162968:role/GDAuditFrameworkContainerScanRole"
         elif "gd-audit-prod-cirrus-scan-results" in accounts_bucket:
-            return "arn:aws:iam::672751022979:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+            return "arn:aws:iam::672751022979:role/GDAuditFrameworkContainerScanRole"
         return None
 
     @staticmethod
     def create_prisma_auth(prisma_secrets):
         auth_dict = dict()
-        auth_dict["password"] = prisma_secrets["id"]
-        auth_dict["username"] = prisma_secrets["secretKey"]
+        auth_dict["password"] = prisma_secrets["prismaAccessKeyId"]
+        auth_dict["username"] = prisma_secrets["prismaSecretKey"]
 
         prisma_auth = json.dumps(auth_dict)
         return prisma_auth
@@ -104,7 +105,8 @@ class Prisma():
     # TODO(lmcdade): Do we expect token to ever be empty
     def create_prisma_api_request(self, method, url, token=None, payload=None, params=None):
         """Helper function to make Prisma API requests"""
-        
+        PRISMA_COMPUTE_REST_API_URL = "https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/"
+
         # As we may hit Prisma API limits, try hitting Prisma at least 3 times before shutting down Vulnerability Scanner
         retries = Retry(
             total=3,

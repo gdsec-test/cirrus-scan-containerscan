@@ -42,7 +42,7 @@ class SecurityTokenServiceClient():
         return credentials
 
 
-SECRET_NAME = "PrismaAccessKeys"
+SECRET_NAME = "/CirrusScan/containerscan/prisma"
 REGION_NAME = "us-west-2"
 
 

@@ -3,10 +3,10 @@ import csv
 import requests
 import os
 from time import sleep
+from datetime import datetime
 from urllib3 import Retry
 from .common import securityhub
 from .errors import ExitContainerScanner, RegistrationError, ProvisioningTimeoutError, DeprovisioningScannerTimeoutError
-from .aws_clients import EC2Client, S3Client, ServiceCatalog
 
 
 class PrismaClient():
@@ -147,8 +147,9 @@ class PrismaClient():
 
 
 class Scanner():
-    def __init__(self, logger):
+    def __init__(self, logger, s3_client):
         self.logger = logger
+        self.s3_client = s3_client
 
     def save_scanner_results(self, results):
         """Save scanner results to an S3 bucket."""
@@ -169,8 +170,7 @@ class Scanner():
             csv_writer.writerow(csv_row)
 
         container_results_csv.close()
-        s3_client = S3Client(self.logger)
-        s3_client.upload_file(temp_csv, results_bucket, results_key)
+        self.s3_client.upload_file(temp_csv, results_bucket, results_key)
 
         if os.path.isfile(temp_csv):
             os.remove(temp_csv)
@@ -240,53 +240,83 @@ class Scanner():
                     self.logger.exception(
                         "Error while processing scanner result:")
 
+    def generate_informational_finding(self, handle):
+        """Generate an informational finding indicating test is complete"""
+
+        self.logger.debug("Test complete")
+        utcnow = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Generate a Security Hub finding
+        finding_id = "vulnscan/complete/%s/%s" % (
+            handle.aws_region(), "SOME_VPC_MOCK")
+        finding = handle.Finding(finding_id)
+
+        finding.ProductFields["Environment"] = os.getenv(
+            "CIRRUS_SCAN_ACCOUNT_ENVIRONMENT", "UNKNOWN")
+        finding.ProductFields["TaskUuid"] = os.getenv(
+            "CIRRUS_SCAN_TASK_UUID", "UNKNOWN")
+        finding.ProductFields["TeamName"] = os.getenv(
+            "CIRRUS_SCAN_ACCOUNT_TEAM_NAME", "UNKNOWN")
+
+        finding.Title = "Vulnscan: [%s, %s] finished at %s" % (
+            handle.aws_region(),
+            "SOME_VPC_MOCK",
+            utcnow,
+        )
+        finding.Compliance = {"Status": "PASSED"}
+        finding.Description = "No description available."
+        finding.GeneratorId = "Vulnscan"
+        finding.LastObservedAt = utcnow
+
+        finding.save()
+
     def provision_scanner(self, provisioned_product_name, vpc_id):
         """Provision a Prisma scanner, using Service Catalog product EC2"""
-        self.logger.info("Provisioning Prisma scanner")
+        pass
+        # self.logger.info("Provisioning Prisma scanner")
 
-        ec2_client = EC2Client(self.logger)
+        # subnet_id = self.ec2_client.get_subnet_id(vpc_id)
+        # product_id = self.ec2_client.get_ec2_product_id()
+        # provisioning_artifact_id = self.ec2_client.get_ec2_product_description(
+        #     product_id)
 
-        subnet_id = ec2_client.get_subnet_id(vpc_id)
-        product_id = ec2_client.get_ec2_product_id()
-        provisioning_artifact_id = ec2_client.get_ec2_product_description(
-            product_id)
+        # script = load_in_script()
+        # provisioned_product_id = self.ec2_client.provision_ec2(
+        #     provisioned_product_name,
+        #     product_id,
+        #     provisioning_artifact_id,
+        #     vpc_id,
+        #     subnet_id,
+        #     script)
 
-        script = load_in_script()
-        provisioned_product_id = ec2_client.provision_ec2(
-            provisioned_product_name,
-            product_id,
-            provisioning_artifact_id,
-            vpc_id,
-            subnet_id,
-            script)
-
-        # Wait for product to be provisioned
-        for setup_count in range(15):
-            response = ec2_client.describe_provisioned_product(
-                provisioned_product_id)
-            if response["ProvisionedProductDetail"]["Status"] == "AVAILABLE":
-                self.logger.info(
-                    "Vulnerability Scanner successfully provisioned")
-                break
-            sleep(60)
-        else:
-            self.logger.error("Provisioning timed out")
-            self.logger.error(response)
-            raise ProvisioningTimeoutError
-        return provisioned_product_name
+        # # Wait for product to be provisioned
+        # for setup_count in range(15):
+        #     response = self.ec2_client.describe_provisioned_product(
+        #         provisioned_product_id)
+        #     if response["ProvisionedProductDetail"]["Status"] == "AVAILABLE":
+        #         self.logger.info(
+        #             "Vulnerability Scanner successfully provisioned")
+        #         break
+        #     sleep(60)
+        # else:
+        #     self.logger.error("Provisioning timed out")
+        #     self.logger.error(response)
+        #     raise ProvisioningTimeoutError
+        # return provisioned_product_name
 
     def deprovision_scanner(self, provisioned_product_name):
         """Deprovision a Prisma scanner, using CloudFront, Service Catalog, EC2, etc."""
-        self.logger.info("Deprovisioning container scanner")
+        pass
+        # self.logger.info("Deprovisioning container scanner")
 
-        # Terminate VulnScanner Service Catalog Product from AWS account
-        sc_client = ServiceCatalog(self.logger)
-        sc_client.terminate_provisioned_product(provisioned_product_name)
-        # wait for deprovisioning to complete
-        for setup_count in range(15):
-            if not provisioned_product_exists(provisioned_product_name):
-                break
-            time.sleep(60)
-        else:
-            self.logger.error("Deprovisioning timed out")
-            raise DeprovisioningScannerTimeoutError
+        # # Terminate VulnScanner Service Catalog Product from AWS account
+        # sc_client = ServiceCatalog(self.logger)
+        # sc_client.terminate_provisioned_product(provisioned_product_name)
+        # # wait for deprovisioning to complete
+        # for setup_count in range(15):
+        #     if not provisioned_product_exists(provisioned_product_name):
+        #         break
+        #     time.sleep(60)
+        # else:
+        #     self.logger.error("Deprovisioning timed out")
+        #     raise DeprovisioningScannerTimeoutError

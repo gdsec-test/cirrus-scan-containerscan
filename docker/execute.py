@@ -6,7 +6,7 @@ import os
 import boto3
 from . import wrapper
 from .common import securityhub
-from .aws_clients import SecurityTokenServiceClient, EC2Client, ServiceCatalog, ECRClient, SSMClient
+from .aws_clients import SecurityTokenServiceClient, EC2Client, ECRClient, SSMClient, SecretsManagerClient
 from .prisma import Scanner, PrismaClient
 from .errors import SecretManagerRetrievalError, ExitContainerScanner
 
@@ -106,48 +106,49 @@ if __name__ == "__main__":
     try:
         results = None
         region = boto3.session.Session().region_name
-        sts_client = SecurityTokenServiceClient(logger)
-        ssm_client = SSMClient(logger)
-        ecr_client = ECRClient(region)
-        prisma_client = PrismaClient(logger)
-        prisma_scanner = Scanner(logger)
-
         audit_role_arn = get_audit_role_arn(get_accounts_bucket())
 
-        token = prisma_client.get_token(audit_role_arn)
-
-        account_id = sts_client.get_account_id()
+        sts_client = SecurityTokenServiceClient(logger)
+        sm_client = SecretsManagerClient(logger)
+        ssm_client = SSMClient(logger)
+        ecr_client = ECRClient(logger)
+        ec2_client = EC2Client(logger)
 
         task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
-        task_name = "/CirrusScan/containerscan/" + vpc_id + "/" + task_uuid
-        isProvisioned = ssm_client.get_task_parameter(
-            task_name) is not None
-        provisioned_product_name = "ContainerScanner-" + vpc_id
+        task_name = f"/CirrusScan/containerscan/{vpc_id}/{task_uuid}"
+        isProvisioned = ssm_client.has_task_parameter(task_name)
 
         # do scan only when there's repo
-        if not isProvisioned and ecr_client.does_repository_have_repos():
+        if not isProvisioned and ecr_client.has_repositories(region):
             # launch EC2 through service catalog with user data
             # - register ECR registry in Prisma with hostname
             # - force repo scan
             # - poll repo scan progress
             # - when complete, get repo scan details, use pagination
             # generate findings for security hub
+            prisma_client = PrismaClient(
+                logger, sts_client, sm_client, ec2_client)
+            prisma_scanner = Scanner(logger)
+            prisma_token = prisma_client.get_token(audit_role_arn)
+
+            account_id = sts_client.get_account_id()
+            ecr_registry_name = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
+            provisioned_product_name = f"ContainerScanner-{vpc_id}"
 
             ssm_client.create_task_parameter(task_name)
 
             prisma_scanner.provision_scanner(provisioned_product_name, vpc_id)
 
-            ecr_registry_name = account_id + ".dkr.ecr." + region + ".amazonaws.com"
+            prisma_client.register_ecr_registry(
+                prisma_token, ecr_registry_name, vpc_id)
 
-            prisma_scanner.register_ecr_registry(
-                token, ecr_registry_name, vpc_id)
+            prisma_client.force_ecr_registry_scan(
+                prisma_token, ecr_registry_name)
 
-            prisma_scanner.force_ecr_registry_scan(token, ecr_registry_name)
+            prisma_client.wait_for_scan_completion()
 
-            prisma_scanner.wait_for_scan_completion()
-
-            results = prisma_scanner.retrieve_scanner_results(
-                token, ecr_registry_name)
+            results = prisma_client.retrieve_scanner_results(
+                prisma_token, ecr_registry_name)
 
             prisma_scanner.save_scanner_results(results)
 

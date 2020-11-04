@@ -22,11 +22,9 @@ class SecurityTokenServiceClient():
         return self.client.get_caller_identity().get("Account")
 
     def assume_role(self, role_arn):
-        """Attempt to assume the specified role_arn"""
-
+        """Assume role and get AWS Credentials"""
         self.logger.info("Attempting to assume role: %s", role_arn)
 
-        credentials = None
         try:
             response = self.client.assume_role(
                 RoleArn=role_arn, RoleSessionName=ROLE_SESSION_NAME
@@ -37,11 +35,10 @@ class SecurityTokenServiceClient():
                 "aws_session_token": response["Credentials"]["SessionToken"],
             }
             self.logger.info("assume_role call succeeeded for: %s", role_arn)
-
+            return credentials
         except ClientError:
             self.logger.exception("assume_role call failed for: %s", role_arn)
-
-        return credentials
+            raise SecretManagerRetrievalError
 
 
 SECRET_NAME = "/CirrusScan/containerscan/prisma"
@@ -49,65 +46,37 @@ REGION_NAME = "us-west-2"
 
 
 class SecretsManagerClient():
-    # -*- coding: utf-8 -*-
     """
     AWS Secrets Manager Client
     Used for interacting with AWS Secrets Manager service.
     """
 
-    def __init__(self, logger, creds):
-        self.client = boto3.client("secretsmanager", REGION_NAME, **creds)
+    def __init__(self, logger):
         self.logger = logger
 
-    @staticmethod
-    def handle_get_token_error(response):
-        if response["Error"]["Code"] == "DecryptionFailureException":
-            # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
-            # Deal with the exception here, and/or rethrow at your discretion.
-            return SecretManagerRetrievalError
-        elif response["Error"]["Code"] == "InternalServiceErrorException":
-            # An error occurred on the server side.
-            # Deal with the exception here, and/or rethrow at your discretion.
-            return SecretManagerRetrievalError
-        elif response["Error"]["Code"] == "InvalidParameterException":
-            # You provided an invalid value for a parameter.
-            # Deal with the exception here, and/or rethrow at your discretion.
-            return SecretManagerRetrievalError
-        elif response["Error"]["Code"] == "InvalidRequestException":
-            # You provided a parameter value that is not valid for the current state of the resource.
-            # Deal with the exception here, and/or rethrow at your discretion.
-            return SecretManagerRetrievalError
-        elif response["Error"]["Code"] == "ResourceNotFoundException":
-            # We can't find the resource that you asked for.
-            # Deal with the exception here, and/or rethrow at your discretion.
-            return SecretManagerRetrievalError
-        else:
-            # Undocumented.
-            return SecretManagerRetrievalError
-
-    @staticmethod
-    def decrypt_secret(response):
-        # Decrypts secret using the associated KMS CMK.
-        # Depending on whether the secret is a string or binary, one of these fields will be populated.
-        if "SecretString" in response:
-            secret = response["SecretString"]
-        else:
-            decoded_binary_secret = b64decode(
-                response["SecretBinary"])
-
-        secret = json.loads(response["SecretString"])
-
-        return json.load(secret)
-
-    def get_prisma_token_secrets(self):
+    def get_prisma_secrets(self, aws_creds):
+        """Get prisma secrets (accesskeys) from secrets manager"""
+        secret = response = None
         try:
-            # Retrieving Tenable API keys
-            response = self.client.get_secret_value(
-                SecretId=SECRET_NAME)
-        except ClientError as e:
-            raise self.handle_get_token_error(e.response)
+            client = boto3.client("secretsmanager", REGION_NAME, **aws_creds)
+            response = client.get_secret_value(SecretId=SECRET_NAME)
+        except ClientError:
+            raise SecretManagerRetrievalError
+        else:
+            if "SecretString" in response:
+                response_secret = response["SecretString"]
+            else:
+                response_secret = b64decode(response["SecretBinary"])
 
-        return self.decrypt_secret(response)
+        secret = json.loads(response_secret)
+
+        if not secret:
+            self.logger.error("Unable to retrieve prisma secrets")
+            raise SecretManagerRetrievalError
+
+        self.logger.info(
+            "Successfully fetched an Prisma Secrets from Secrets Manager.")
+        return secret
 
 
 class EC2Client():
@@ -206,7 +175,6 @@ class S3Client():
 
     def upload_file(self, data, bucket, key):
         try:
-            s3_client = S3Client(self.logger)
             self.client.upload_file(data, bucket, key)
         except ClientError:
             self.logger.exception(
@@ -224,7 +192,6 @@ class ServiceCatalog():
     def terminate_provisioned_product(self, provisioned_product_name):
         # Terminate VulnScanner Service Catalog Product from AWS account
         try:
-            sc_client = ServiceCatalog(self.logger)
             response = self.client.terminate_provisioned_product(
                 ProvisionedProductName=provisioned_product_name
             )
@@ -242,17 +209,19 @@ class ServiceCatalog():
 
 
 class ECRClient():
-    def __init__(self, region):
-        self.client = boto3.client("ecr", region_name=region)
+    def __init__(self, logger):
+        self.logger = logger
 
-    def does_repository_have_repos(self):
+    def has_repositories(self, region):
         """Parse through parameters, and get scan targets"""
-
-        repositories = self.client.describe_repositories()["repositories"]
-        repositories_uris = [repository["repositoryUri"]
-                             for repository in repositories]
-
-        return len(repositories_uris) > 0
+        try:
+            client = boto3.client("ecr", region_name=region)
+            response = client.describe_repositories()
+            repositories_uris = [repo["repositoryUri"]
+                                 for repo in response["repositories"]]
+            return len(repositories_uris) > 0
+        except ClientError:
+            self.logger.error(f"Error while calling describe ECR in {region}")
 
 
 class SSMClient():
@@ -265,16 +234,19 @@ class SSMClient():
 
         expiration_time = datetime.datetime.now() + datetime.timedelta(hours=1)
 
-        self.client.put_parameter(
-            Name=task_name,
-            Description="Container Scan Active Task",
-            Value=str(expiration_time),
-            Type="String",
-            Tier="Standard",
-            Overwrite=True,
-        )
-
-        self.logger.debug("SSM task parameter created: %s", task_name)
+        try:
+            self.client.put_parameter(
+                Name=task_name,
+                Description="Container Scan Active Task",
+                Value=str(expiration_time),
+                Type="String",
+                Tier="Standard",
+                Overwrite=True,
+            )
+            self.logger.debug("SSM task parameter created: %s", task_name)
+        except ClientError:
+            self.logger.error(f"Failed to create task paramter : {task_name}")
+            raise
 
     def get_task_parameter(self, task_name):
         """Obtain task parameter from Parameter Store"""
@@ -293,6 +265,9 @@ class SSMClient():
 
         self.logger.debug("%s : %s", task_name, response["Parameter"]["Value"])
         return response["Parameter"]["Value"]
+
+    def has_task_parameter(self, task_name):
+        return self.get_task_parameter(task_name) is not None
 
     def delete_task_parameter(self, task_name):
         """Remove persistent lock marker in Parameter Store"""

@@ -1,21 +1,11 @@
 #!/usr/bin/env python3
 
-import base64
-import csv
 import datetime
-import json
 import logging
-import math
 import os
-from random import randint
-import time
 import boto3
-import botocore
-import requests
-from botocore.exceptions import ClientError
-from requests.packages.urllib3.util.retry import Retry
-import common.securityhub
-import wrapper
+from . import wrapper
+from .common import securityhub
 from .aws_clients import SecurityTokenServiceClient, EC2Client, ServiceCatalog, ECRClient, SSMClient
 from .prisma import Scanner, Prisma
 from .errors import ExitContainerScanner
@@ -24,18 +14,12 @@ from .utils import initialize_logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# TODO: add function to security hub class
-def initialize_security_hub():
-    exception_rules = wrapper.get_exception_rules()
-    return common.securityhub.SecurityHub_Manager(
-        exception_rules=exception_rules)
-
 
 # TODO: add function to security hub class
 def generate_informational_finding(handle):
     """Generate an informational finding indicating test is complete"""
 
-    log.debug("Test complete")
+    logger.debug("Test complete")
     utcnow = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Generate a Security Hub finding
@@ -63,9 +47,13 @@ def generate_informational_finding(handle):
 
     finding.save()
 
+
 if __name__ == "__main__":
     initialize_logging()
-    security_hub_context = initialize_security_hub()
+
+    exception_rules = wrapper.get_exception_rules()
+    security_hub_context = securityhub.SecurityHub_Manager(
+        exception_rules=exception_rules)
 
     results = None
     lock_id = None
@@ -81,7 +69,7 @@ if __name__ == "__main__":
 
         region = boto3.session.Session().region_name
         ecr_client = ECRClient(region)
-        
+
         token = prisma.get_token()
 
         account_id = sts_client.get_account_id()
@@ -102,7 +90,7 @@ if __name__ == "__main__":
             # generate findings for security hub
 
             ssm_client.create_task_parameter(task_name)
-            
+
             prisma_scanner.provision_scanner(provisioned_product_name, vpc_id)
 
             ecr_registry_name = account_id + ".dkr.ecr." + region + ".amazonaws.com"
@@ -142,7 +130,8 @@ if __name__ == "__main__":
                     compliance = "FAIL"
                     break
             wrapper.put_status(
-                {"status": "SUCCESS", "compliance": compliance, "finding_data": scan_info}
+                {"status": "SUCCESS", "compliance": compliance,
+                    "finding_data": scan_info}
             )
 
             prisma_scanner.deprovision_scanner(provisioned_product_name)

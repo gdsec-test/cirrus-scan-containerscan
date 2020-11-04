@@ -16,3 +16,8 @@ coverage.xml
 
 .vscode/settings.json
 .markdownlint.json
+
+# Custom
+.DS_Store
+.vscode
+.venv*

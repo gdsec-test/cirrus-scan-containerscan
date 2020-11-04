@@ -24,15 +24,15 @@ def get_audit_role_arn():
         raise SecretManagerRetrievalError
 
     if "dev-private" in accounts_bucket:
-        auditRoleArn = "arn:aws:iam::878238275157:role/GDAuditFrameworkContainerScanRole"
+        auditRoleArn = "arn:aws:iam::878238275157:role/GD-AuditFramework-ContainerScan-AssumeRole"
     elif "gd-audit-prod-cirrus-scan-results-p" in accounts_bucket:
-        auditRoleArn = "arn:aws:iam::339078146124:role/GDAuditFrameworkContainerScanRole"
+        auditRoleArn = "arn:aws:iam::339078146124:role/GD-AuditFramework-ContainerScan-AssumeRole"
     elif "gd-audit-prod-cirrus-scan-results-h" in accounts_bucket:
-        auditRoleArn = "arn:aws:iam::512827982966:role/GDAuditFrameworkContainerScanRole"
+        auditRoleArn = "arn:aws:iam::512827982966:role/GD-AuditFramework-ContainerScan-AssumeRole"
     elif "gd-audit-prod-cirrus-scan-results-r" in accounts_bucket:
-        auditRoleArn = "arn:aws:iam::906957162968:role/GDAuditFrameworkContainerScanRole"
+        auditRoleArn = "arn:aws:iam::906957162968:role/GD-AuditFramework-ContainerScan-AssumeRole"
     elif "gd-audit-prod-cirrus-scan-results" in accounts_bucket:
-        auditRoleArn = "arn:aws:iam::672751022979:role/GDAuditFrameworkContainerScanRole"
+        auditRoleArn = "arn:aws:iam::672751022979:role/GD-AuditFramework-ContainerScan-AssumeRole"
     else:
         logger.error("Error in retrieving auditRoleArn. Exiting!")
         raise SecretManagerRetrievalError

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """AWS Security Hub helper module"""
-# pylint: disable=bad-continuation
+# pylint: disable=too-many-lines
 
 import copy
 import datetime
@@ -54,7 +54,7 @@ def set_severity(normalized, original=None):
     return sev_dict
 
 
-class Business_Exception:
+class Business_Exception:  # pylint: disable=invalid-name
     """GoDaddy Business Exception"""
 
     def __init__(self, exception_dict):
@@ -108,7 +108,7 @@ class Business_Exception:
         return self._dict
 
     @staticmethod
-    def _match(key_list, value, pattern):
+    def _match(key_list, value, pattern):  # pylint: disable=too-many-return-statements
         """Match specified attribute against regular expression
 
         key_list    list of key components;
@@ -159,11 +159,11 @@ class Business_Exception:
         # We are at the terminal key now and we can test against pattern.
         # If the value is a string, we test directly.
         if isinstance(value, str):
-            return True if pattern.search(value) else False
+            return bool(pattern.search(value))
 
         # If the value is an integer, we convert to string and test.
         if isinstance(value, int):
-            return True if pattern.search(str(value)) else False
+            return bool(pattern.search(str(value)))
 
         # We don't know how to compare this, so fail
         log.warning("can't test against regex: %s", value)
@@ -172,21 +172,24 @@ class Business_Exception:
     def applies(self, finding):
         """Does this exception apply to the specified finding?"""
 
+        # The finding may be either a dict or a Finding() object. Get a
+        # dict representation for consistency.
+        f_dict = finding if isinstance(finding, dict) else finding.to_dict()
+
         # If an account filter is present, check it first
-        if self._account and finding.AwsAccountId not in self._account:
+        if self._account and f_dict["AwsAccountId"] not in self._account:
             return False
 
         # If the pattern has not been compiled, do that now
         if self._pattern is None:
             self._pattern = {}
-            for k, v in self._dict["pattern"].items():
-                self._pattern[k] = re.compile(v)
+            for key, val in self._dict["pattern"].items():
+                self._pattern[key] = re.compile(val)
 
         # Oooookay. pattern is a dict, where keys are dot-delimited hierarchies
         # of keys, and values are regular expressions. Everything must match.
-        f_dict = finding.to_dict()  # We don't want to mess with attributes
-        for k, r in self._pattern.items():  # Key, Regex
-            if not self._match(k.split("."), f_dict, r):
+        for key, rexp in self._pattern.items():  # Key, Regex
+            if not self._match(key.split("."), f_dict, rexp):
                 return False
         return True
 
@@ -253,7 +256,8 @@ class Finding:  # pylint: disable=too-many-instance-attributes
     # Collectively, these define the fields that are valid for a finding
     ALLOWED_FIELDS = IMPORT_FIELDS | UPDATE_FIELDS
 
-    def __init__(
+    # pylint: disable=too-many-statements
+    def __init__(  # noqa: Disable Flake8
         self,
         manager,
         finding_id=None,
@@ -487,6 +491,12 @@ class Finding:  # pylint: disable=too-many-instance-attributes
         ]:
             del self._finding["ProductFields"][key]
 
+        # The Resources attribute, if present, is limited to 32 elements.
+        # Truncate it if it's too long.
+        if len(self._finding.get("Resources", [])) > 32:
+            log.warning("Truncating finding Resources to 32 elements")
+            self._finding["Resources"] = self._finding["Resources"][:32]
+
         return True
 
     def _exception_processing(self):
@@ -512,12 +522,62 @@ class Finding:  # pylint: disable=too-many-instance-attributes
                 )
                 return
 
+    def _reopen_processing(self):
+        """Handle correctly reactivating an archived finding"""
+
+        # To avoid a test, we assume that self._isnew == True.
+        #
+        # If the finding does not already exist in Security Hub, there cannot be
+        # a problem.
+        before = self._manager.probe_finding(
+            self._finding["Id"], self._finding["AwsAccountId"]
+        )
+        if not before:
+            return
+
+        # When this occurs, we must use BatchUpdateFindings instead of the usual
+        # BatchImportFindings to update any modified protected field, regardless
+        # of how/what/why/when the update was made. We know _needbut is empty at
+        # this point because "it's a new finding"
+        self._needbut = {
+            x for x in self.UPDATE_FIELDS if self._finding.get(x) != before.get(x)
+        }
+
+        # Just to be a purist, anything updated by BatchUpdateFindings does not
+        # need to be updated by BatchImportFindings
+        self._needbit.difference_update(self.UPDATE_FIELDS)
+
+        # Corner case... Security Hub will not allow us to delete populated
+        # fields (if we even make it far enough to submit the request). This
+        # may be most common with UserDefinedFields, which gets all kinds of
+        # annotations but might be unpopulated for a "new" finding. Check for
+        # this and try to make the obvious troublemakers valid.
+        for attr in [x for x in self._needbut if x not in self._finding]:
+            # attr is not in the "new" finding, but is in needbut, so it follows
+            # it was defined before and isn't defined now. It must be populated
+            # with some sort of valid placeholder, but of course "valid" varies
+            # by attribute. Fix where expedient and kludge elsewhere.
+            log.debug("Reopened finding clears %s", attr)
+            if attr == "UserDefinedFields":
+                # Add a placeholder to cure this attribute
+                self._finding["UserDefinedFields"] = {
+                    "previously_archived": before["UpdatedAt"]
+                }
+            else:
+                # There is no general solution, and we don't know how common
+                # any other case will be. This solution, which approximates the
+                # previous behavior, is to ignore the field (and silently
+                # inherit the content from the previously-archived finding).
+                log.warning("Inheriting: %s = %s", attr, before[attr])
+                self._needbut.remove(attr)
+
     def _update_state(self):
         """Maintain timestamp attributes"""
 
         # Test new findings against known exception rules
         if self._isnew:
             self._exception_processing()
+            self._reopen_processing()  # No protected field updates after this
 
         # Modify fields for update scenario
         utcnow = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -550,7 +610,7 @@ class Finding:  # pylint: disable=too-many-instance-attributes
             self._finding["Id"] = new_finding_id
             self._setbyuser.add("Id")
             self._isnew = True
-            self._needbut = {}
+            self._needbut = set()
             return
 
         # Merge. Precedence (from highest to lowest) is:
@@ -646,7 +706,7 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             for rule in exception_rules:
                 try:
                     self._exceptions.append(Business_Exception(rule))
-                except:
+                except Exception:  # pylint: disable=broad-except
                     log.warning("Ignoring invalid exception rule: %s", rule)
 
     def Finding(
@@ -700,10 +760,12 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
 
         self._dirty = False
         log.info(
-            "cached %i findings for prefix %s", processed, self._prefix,
+            "cached %i findings for prefix %s",
+            processed,
+            self._prefix,
         )
 
-    def _load_one(self, finding_id, account_id=None):
+    def _load_one(self, finding_id, account_id=None, state=None):
         """Attempt to load one finding into cache"""
 
         acct = self._account if account_id is None else account_id
@@ -711,8 +773,9 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         aws_filters = {
             "Id": [{"Value": finding_id, "Comparison": "EQUALS"}],
             "AwsAccountId": [{"Comparison": "EQUALS", "Value": acct}],
-            "RecordState": [{"Comparison": "EQUALS", "Value": "ACTIVE"}],
         }
+        if state is not None:
+            aws_filters["RecordState"] = [{"Comparison": "EQUALS", "Value": state}]
 
         result = self._securityhub.get_findings(Filters=aws_filters)["Findings"]
 
@@ -724,18 +787,10 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             return finding
         return None
 
-    def _mark_unmodified_findings(self, dont_archive=None):
+    def _mark_unmodified_findings(self, filter_function, filter_data):
         """Mark unmodified findings as archived"""
 
         utcnow = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-        # If we need regex construction, do it once for everything
-        if dont_archive is not None:
-            # Construct a single regex equivalent to the input list
-            full_pattern = ""
-            for user_regex in dont_archive:
-                full_pattern += "|" + user_regex
-            full_regex = re.compile(full_pattern[1:])
 
         for acct in self._cache:
             if acct not in self._imported_ids:
@@ -746,30 +801,55 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             # archived.
             stale_ids = set(self._cache[acct].keys()) - self._imported_ids[acct]
 
-            # dont_archive is a list of regular expressions that specify findings
-            # we do not want to autoarchive under any circumstances. All matching
-            # findings in the stale set should be removed from it.
-            if stale_ids and dont_archive is not None:
+            # If the caller provided a filter function, we need to call it for
+            # each finding (whether or not we think it should be archived) and
+            # then possibly recategorize it.
+            if filter_function is not None:
+                for finding_id in self._cache[acct]:
+                    was_modified = finding_id not in stale_ids
+                    try:
+                        # NB. doc tells user not to modify the finding (i.e. the
+                        # cache) in filter_function() so we don't have to worry
+                        # about state tracking deltas.
+                        verdict = filter_function(
+                            finding=self._cache[acct][finding_id],
+                            modified=was_modified,
+                            filter_data=filter_data,
+                        )
+                    except Exception as err:  # pylint: disable=broad-except
+                        # Any failure means "True" so we leave finding alone
+                        log.warning(
+                            "%s raised exception for %s %s: %s",
+                            filter_function,
+                            acct,
+                            finding_id,
+                            err,
+                        )
+                        verdict = True
 
-                # Test every member of stale_ids and note all matches
-                ignored_ids = set()
-                for finding_id in stale_ids:
-                    if full_regex.search(finding_id) is not None:
-                        ignored_ids.add(finding_id)
-
-                # If findings should be retained, remove them from stale set
-                if ignored_ids:
-                    stale_ids.difference_update(ignored_ids)
-                    log.info(
-                        "retaining %i unmodified findings for %s: %s",
-                        len(ignored_ids),
-                        acct,
-                        json.dumps(list(ignored_ids)),
-                    )
-                else:
-                    log.info(
-                        "no unmodified findings for %s matched exclusion filters.", acct
-                    )
+                    # If the user function vetoed our original decision,
+                    # recategorize the finding appropriately.
+                    if was_modified != verdict:  # This means we disagreed
+                        if verdict:
+                            # User wants to keep this "stale" [sic] finding. The
+                            # finding must be in stale_ids by definition and this
+                            # cannot raise an exception.
+                            stale_ids.remove(finding_id)
+                            log.debug(
+                                "retaining unmodified finding for %s: %s",
+                                acct,
+                                finding_id,
+                            )
+                        else:
+                            # User wants to archive this finding. By same logic as
+                            # above, we know it's missing from stale_ids, although
+                            # we don't care so much here (add() is idempotent).
+                            stale_ids.add(finding_id)
+                            log.debug(
+                                "archiving modified finding for %s: %s",
+                                acct,
+                                finding_id,
+                            )
 
             # If we still have findings to autoarchive, update each of them
             if stale_ids:
@@ -789,13 +869,14 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
                     self._dirty = True
                     # Set to False disables unnecessary update-findings()
                     log.info(
-                        "marked %i unmodified findings in %s for archival: %s",
+                        "marked %i findings in %s for archival: %s",
                         len(fixed),
                         acct,
                         json.dumps(fixed),
                     )
 
-    def _flush_cache(self, just_one=None, batch_size=100):
+    # pylint: disable=too-many-statements
+    def _flush_cache(self, just_one=None, batch_size=100):  # noqa Disable Flake8
         """Import all cached findings to SecurityHub"""
 
         # If no updates have been made, this is a no-op
@@ -858,7 +939,8 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
                     log.debug("Import response (success): %s", json.dumps(response))
             except botocore.exceptions.ParamValidationError as oops:
                 reason = oops.args[0]
-                # 'Parameter validation failed:\nUnknown parameter in Findings[10].Compliance: "Bogus", must be one of: Status, RelatedRequirements, StatusReasons'
+                # 'Parameter validation failed:\nUnknown parameter in Findings[10].Compliance: "Bogus",
+                # must be one of: Status, RelatedRequirements, StatusReasons'
                 log.error("Import response (exception): %s", reason)
 
                 # Similar to above; a named finding failed to validate. Drop it
@@ -932,7 +1014,7 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
                 self._demographics["kind"]["failed"] += 1
             else:
                 log.debug("Update response (success): %s", json.dumps(response))
-        except Exception as oops:
+        except Exception as oops:  # pylint: disable=broad-except
             reason = oops.args[0]
             log.error("Update response (exception): %s", reason)
             suspense = set()  # assume nothing was updated
@@ -964,7 +1046,7 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         try:
             result = self._securityhub.get_master_account()
             self._master = result["Master"]["MemberStatus"] != "Associated"
-        except:
+        except Exception:  # pylint: disable=broad-except
             self._master = True
 
     def is_master(self):
@@ -1009,7 +1091,7 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             for acct in self._cache:
                 result.extend(self.list_all_findings(acct))
             return result
-        elif account_id not in self._cache:
+        if account_id not in self._cache:
             return []
         return list(self._cache[account_id].keys())
 
@@ -1022,7 +1104,7 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             for acct in self._imported_ids:
                 result.extend(self.list_modified_findings(acct))
             return result
-        elif account_id not in self._imported_ids:
+        if account_id not in self._imported_ids:
             return []
         return list(self._imported_ids[account_id])
 
@@ -1035,10 +1117,10 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             for acct in self._cache:
                 result.extend(self.list_unmodified_findings(acct))
             return result
-        elif account_id not in self._cache:
+        if account_id not in self._cache:
             # Bogus account can't have any findings (unmodified or otherwise)
             return []
-        elif account_id not in self._imported_ids:
+        if account_id not in self._imported_ids:
             # If no modified findings, then all of them are unmodified
             return list(self._cache[account_id].keys())
         # Otherwise, known findings not modified are unmodified
@@ -1080,7 +1162,9 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
         )
         self._in_transaction = True
 
-    def end_transaction(self, autoarchive=False, dont_archive=None):
+    def end_transaction(
+        self, autoarchive=False, filter_function=None, filter_data=None
+    ):
         """End a batch of SecurityHub updates"""
 
         if self._in_transaction:
@@ -1111,7 +1195,7 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             # If requested, archive old findings. This is where
             # self._demographics["kind"]["archived"] is computed.
             if autoarchive:
-                self._mark_unmodified_findings(dont_archive)
+                self._mark_unmodified_findings(filter_function, filter_data)
 
             # Send all changes to SecurityHub
             self._flush_cache()
@@ -1136,9 +1220,19 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
             log.debug("No %s in cache", finding_id)
             return None
         log.debug("No %s in cache, trying single load", finding_id)
+        return self._load_one(finding_id, acct, "ACTIVE")
+
+    def probe_finding(self, finding_id, account_id=None):
+        """Look for finding at Security Hub"""
+
+        # This is similar to get_finding(), but we are looking for findings that
+        # might not be cached (because they are archived, for example). Here we
+        # bypass the cache entirely and look for the finding (in any state); if
+        # one is found, return it directly to the caller (again bypassing cache).
+        acct = self._account if account_id is None else account_id
         return self._load_one(finding_id, acct)
 
-    def put_finding(self, f, import_set, update_set):
+    def put_finding(self, f, import_set, update_set):  # pylint: disable=unused-argument
         """Create/overwrite finding in cache"""
 
         finding_id = f["Id"]

@@ -2,11 +2,13 @@ import json
 import csv
 import requests
 import os
+from io import StringIO
 from time import sleep
+import boto3
 from datetime import datetime
 from urllib3 import Retry
-from .common import securityhub
-from .errors import ExitContainerScanner, RegistrationError, ProvisioningTimeoutError, DeprovisioningScannerTimeoutError
+from common import securityhub
+from errors import ExitContainerScanner, RegistrationError, ProvisioningTimeoutError, DeprovisioningScannerTimeoutError
 
 
 class PrismaClient():
@@ -20,6 +22,7 @@ class PrismaClient():
 
     def get_token(self, iam_role_arn):
         """Retrieves Prisma Access key and secret key id from Secret Manager"""
+        
         aws_creds = self.sts_client.assume_role(iam_role_arn)
         prisma_secrets = self.sm_client.get_prisma_secrets(aws_creds)
 
@@ -29,36 +32,42 @@ class PrismaClient():
         }
 
         response = self.create_prisma_api_request(
-            "GET", url="/authenticate", payload=payload)
+            "POST", url="/authenticate", payload=payload)
 
         text_json = json.loads(response.text)
         token = text_json["token"]
         return token
 
     def register_ecr_registry(self, token, ecr_registry_name, vpc_id):
-        """Register Scanner Instance with ECR registry in Prisma"""
-        self.logger.info("Waiting for Prisma scanner registration")
-
-        # make a call to get the name of the provisioned scanner
+        """Register ECR registry with Prisma"""
+     
         response = self.ec2_client.describe_instances(vpc_id)
 
-        scanner_dnsname = None
+        region = boto3.session.Session().region_name
+        account_id = boto3.client("sts").get_caller_identity().get("Account")
+        scanner_name = "cirrusscan" + "-" + account_id + "-" + region + "-" + vpc_id
+
         try:
-            scanner_dnsname = response["Reservations"][0]["Instances"][0]["NetworkInterfaces"][0]["PrivateDnsName"]
+            scanner_dnsname = response["Reservations"][0]["Instances"][0]["NetworkInterfaces"][
+                0
+            ]["PrivateDnsName"]
             self.logger.info("Scanner name : %s" % scanner_dnsname)
         except KeyError:
             self.logger.error("Scanner IP not found")
+            scanner_dnsname = None
 
         if scanner_dnsname is None:
             raise RegistrationError
 
         # register ECR registry
         # curl -H "Authorization: Bearer "${TOKEN}"" -X POST -d '{"registry":"226955763576.dkr.ecr.us-west-2.amazonaws.com","repository":"","tag":"","cap":5,"os":"linux","hostname":"","namespace":"","useAWSRole":true,"version":"aws","credential":{"_id":"","type":"","accountID":"","accountGUID":"","secret":{"encrypted":""},"apiToken":{"encrypted":""},"lastModified":"0001-01-01T00:00:00Z","owner":"","tokens":null},"credentialID":"","roleArn":"","scanners":1,"versionPattern":""}' https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/settings/registry
-        payload_template = '{"registry":"","repository":"","tag":"","cap":5,"os":"linux","hostname":"","namespace":"","useAWSRole":true,"version":"aws","credential":{"_id":"","type":"","accountID":"","accountGUID":"","secret":{"encrypted":""},"apiToken":{"encrypted":""},"lastModified":"0001-01-01T00:00:00Z","owner":"","tokens":null},"credentialID":"","roleArn":"","scanners":1,"versionPattern":""}'
+        payload_template = '{"registry":"","repository":"","tag":"","cap":5,"os":"linux","hostname":"","namespace":"","useAWSRole":true,"version":"aws","credentialID":"","roleArn":"","scanners":1,"versionPattern":""}'
         payload = json.loads(payload_template)
         payload["registry"] = ecr_registry_name
         payload["hostname"] = scanner_dnsname
 
+        self.logger.debug("registry payload : %s" % payload)
+        
         self.create_prisma_api_request(
             "POST", "/settings/registry", token=token, payload=payload)
 
@@ -66,18 +75,18 @@ class PrismaClient():
             f"Registered {scanner_dnsname} with ECR registry {ecr_registry_name}!")
 
     def force_ecr_registry_scan(self, token, ecr_registry_name):
-        # curl -H "Authorization: Bearer "${TOKEN}"" -X POST -d '{"registry":"226955763576.dkr.ecr.us-west-2.amazonaws.com","repository":"","tag":"","cap":5,"os":"linux","hostname":"","namespace":"","useAWSRole":true,"version":"aws","credential":{"_id":"","type":"","accountID":"","accountGUID":"","secret":{"encrypted":""},"apiToken":{"encrypted":""},"lastModified":"0001-01-01T00:00:00Z","owner":"","tokens":null},"credentialID":"","roleArn":"","scanners":1,"versionPattern":""}' https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/settings/registry
+        
         payload_template = '{ "tag" : { "registry" : "" } }'
         payload = json.loads(payload_template)
-        payload["registry"] = ecr_registry_name
-
-        self.create_prisma_api_request(
+        payload["tag"]["registry"] = ecr_registry_name
+      
+        response = self.create_prisma_api_request(
             "POST", "/registry/scan", token=token, payload=payload)
 
         self.logger.info(f"Forced scan of ECR registry {ecr_registry_name}!")
 
     def retrieve_scanner_results(self, token, ecr_registry_name):
-        # https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/registry/download?registry="226955763576.dkr.ecr.us-east-1.amazonaws.com"
+        
         param = "registry=" + ecr_registry_name
 
         # all results in csv format
@@ -92,8 +101,9 @@ class PrismaClient():
         """Wait for the scan to be completed"""
 
         self.logger.info("Waiting for Container Scan to finish")
-        # sleep for 45 minutes due to lack of progress api
-        sleep(45*60)
+        # sleep for ?? minutes due to lack of progress api
+        #TODO change to 30
+        sleep(30*60)
 
     def create_prisma_api_request(self, method, url, token=None, payload=None, params=None):
         """Helper function to make Prisma API requests"""
@@ -113,7 +123,7 @@ class PrismaClient():
         if token is not None:
             headers = {"Authorization": "Bearer " + token}
         else:
-            headers = {"content-type": "application/json; charset=UTF-8"}
+            headers = {"content-type": "application/json"}
 
         try:
             adapter = requests.adapters.HTTPAdapter(max_retries=retries)
@@ -123,12 +133,12 @@ class PrismaClient():
             session.mount("https://", adapter)
 
             session.headers = headers
-            fullurl = PRISMA_COMPUTE_REST_API_URL + url
-
+            fullurl = PRISMA_COMPUTE_REST_API_URL + url   
+         
             if method == "POST":
                 response = session.post(
                     fullurl, params=params, data=payload, timeout=5.0)
-            else:
+            else:                
                 response = session.get(
                     fullurl, params=params, data=payload, timeout=5.0)
 
@@ -158,18 +168,19 @@ class Scanner():
         results_bucket = os.getenv("CIRRUS_SCAN_RESULTS_BUCKET")
         task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
         results_key = "containerscan/%s/results.csv" % task_uuid
-
-        csv_results = csv.reader(results.split("\r\n"), delimiter=",")
-
+        
         temp_csv = "/tmp/results.csv"
         container_results_csv = open(temp_csv, "w")
         csv_writer = csv.writer(container_results_csv)
-
-        for result in csv_results:
-            csv_row = result
-            csv_writer.writerow(csv_row)
+        
+        with StringIO(results) as input_file:
+            csv_reader = csv.reader(input_file, delimiter=",", quotechar='"')
+            for row in csv_reader:
+                csv_row = row
+                csv_writer.writerow(csv_row)
 
         container_results_csv.close()
+
         self.s3_client.upload_file(temp_csv, results_bucket, results_key)
 
         if os.path.isfile(temp_csv):
@@ -269,54 +280,3 @@ class Scanner():
         finding.LastObservedAt = utcnow
 
         finding.save()
-
-    def provision_scanner(self, provisioned_product_name, vpc_id):
-        """Provision a Prisma scanner, using Service Catalog product EC2"""
-        pass
-        # self.logger.info("Provisioning Prisma scanner")
-
-        # subnet_id = self.ec2_client.get_subnet_id(vpc_id)
-        # product_id = self.ec2_client.get_ec2_product_id()
-        # provisioning_artifact_id = self.ec2_client.get_ec2_product_description(
-        #     product_id)
-
-        # script = load_in_script()
-        # provisioned_product_id = self.ec2_client.provision_ec2(
-        #     provisioned_product_name,
-        #     product_id,
-        #     provisioning_artifact_id,
-        #     vpc_id,
-        #     subnet_id,
-        #     script)
-
-        # # Wait for product to be provisioned
-        # for setup_count in range(15):
-        #     response = self.ec2_client.describe_provisioned_product(
-        #         provisioned_product_id)
-        #     if response["ProvisionedProductDetail"]["Status"] == "AVAILABLE":
-        #         self.logger.info(
-        #             "Vulnerability Scanner successfully provisioned")
-        #         break
-        #     sleep(60)
-        # else:
-        #     self.logger.error("Provisioning timed out")
-        #     self.logger.error(response)
-        #     raise ProvisioningTimeoutError
-        # return provisioned_product_name
-
-    def deprovision_scanner(self, provisioned_product_name):
-        """Deprovision a Prisma scanner, using CloudFront, Service Catalog, EC2, etc."""
-        pass
-        # self.logger.info("Deprovisioning container scanner")
-
-        # # Terminate VulnScanner Service Catalog Product from AWS account
-        # sc_client = ServiceCatalog(self.logger)
-        # sc_client.terminate_provisioned_product(provisioned_product_name)
-        # # wait for deprovisioning to complete
-        # for setup_count in range(15):
-        #     if not provisioned_product_exists(provisioned_product_name):
-        #         break
-        #     time.sleep(60)
-        # else:
-        #     self.logger.error("Deprovisioning timed out")
-        #     raise DeprovisioningScannerTimeoutError

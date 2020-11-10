@@ -2,12 +2,13 @@ import json
 from base64 import b64decode
 import datetime
 import boto3
+import time
 from botocore.exceptions import ClientError
-from .errors import SecretManagerRetrievalError, VPCNotFound
+from errors import SecretManagerRetrievalError, VPCNotFound,DeprovisioningScannerTimeoutError
 
 # Deploy scanner instances using this ServiceCatalog offering version
 SC_EC2_VERSION = "1.0.11"
-AMI_IMAGE_ID = "/GoldenAMI/gd-amzn2-eks-1-17/latest"
+AMI_IMAGE_ID = "/GoldenAMI/gd-amzn2-eks-1-18/active"
 ROLE_SESSION_NAME = "cirrus-scan"
 
 
@@ -44,7 +45,6 @@ class SecurityTokenServiceClient():
 SECRET_NAME = "/CirrusScan/containerscan/prisma"
 REGION_NAME = "us-west-2"
 
-
 class SecretsManagerClient():
     """
     AWS Secrets Manager Client
@@ -58,8 +58,11 @@ class SecretsManagerClient():
         """Get prisma secrets (accesskeys) from secrets manager"""
         secret = response = None
         try:
+                        
             client = boto3.client("secretsmanager", REGION_NAME, **aws_creds)
             response = client.get_secret_value(SecretId=SECRET_NAME)
+
+            
         except ClientError:
             raise SecretManagerRetrievalError
         else:
@@ -110,8 +113,32 @@ class ECRClient():
 
 class SSMClient():
     def __init__(self, logger):
-        self.client = boto3.client("ss")
+        self.client = boto3.client("ssm")
         self.logger = logger
+
+    def get_vpc_id(self):
+        paramName = "/AdminParams/VPC/ID"
+        return self.get_ssm_parameter_by_name(paramName)
+
+    def get_org_type(self):        
+        orgtypeparam = "/AdminParams/Team/OrgType"
+        return self.get_ssm_parameter_by_name(orgtypeparam)
+        
+    def get_ssm_parameter_by_name (self,param):
+       
+        try:
+            response = self.client.get_parameter(Name=param)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ParameterNotFound":
+                self.logger.debug("%s : Not found", param)
+                return None
+            raise
+
+        if not response["Parameter"]:
+            return None
+
+        self.logger.debug("%s : %s", param, response["Parameter"]["Value"])
+        return response["Parameter"]["Value"]
 
     def create_task_parameter(self, task_name):
         """Create persistent lock marker in Parameter Store"""
@@ -172,101 +199,125 @@ class EC2Client():
                 {"Name": "tag:Name", "Values": ["ContainerScanner"]},
                 {"Name": "instance-state-name", "Values": ["running"]},
                 {"Name": "vpc-id", "Values": [vpc_id]},
-            ])
+            ])    
 
-    # def get_ec2_product_id(self):
-    #     response = self.sc_client.search_products(
-    #         Filters={"FullTextSearch": ["EC2"]}
-    #     )
-    #     product_id = response["ProductViewSummaries"][0]["ProductId"]
+    def get_subnet_id(self, vpc_id):
+        subnet_id = None
+        response = self.client.describe_subnets(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
 
-    #     return product_id
+        for subnet in response["Subnets"]:
+            if subnet["AvailableIpAddressCount"] > 4:
+                for tag in subnet["Tags"]:
+                    if tag["Key"] == "Name":
+                        if "private" in tag["Value"]:
+                            subnet_id = subnet["SubnetId"]
+                            break
+            if subnet_id != None:
+                break
 
-    # def get_ec2_product_description(self, product_id):
-    #     response = self.sc_client.describe_product(Id=product_id)
+        if subnet_id is None:
+            self.logger.info("No private subnet in VPC %s. Exiting!", vpc_id)
+            raise VPCNotFound
 
-    #     provisioning_artifact_id = None
-    #     for provision_artifact in response["ProvisioningArtifacts"]:
-    #         if provision_artifact["Name"] == SC_EC2_VERSION:
-    #             provisioning_artifact_id = provision_artifact["Id"]
+        self.logger.debug("VPC ID: %s", vpc_id)
+        self.logger.debug("Subnet Id: %s", subnet_id)
 
-    #     if provisioning_artifact_id == None:
-    #         raise RuntimeError("Unable to find provision artifact id")
+        return subnet_id   
 
-    #     return provisioning_artifact_id
+class ServiceCatalog():
+    def __init__(self, logger):
+        self.logger = logger
+        self.client = boto3.client('servicecatalog')
 
-    # def get_subnet_id(self, vpc_id):
-    #     subnet_id = None
-    #     response = self.client.describe_subnets(
-    #         Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+    def provisioned_product_exists(self,provisioned_product_name):
+    
+        try:
+             response = self.client.describe_provisioned_product(Name=provisioned_product_name)
+        except self.client.exceptions.ResourceNotFoundException as e:
+            return False
 
-    #     for subnet in response["Subnets"]:
-    #         if subnet["AvailableIpAddressCount"] > 4:
-    #             for tag in subnet["Tags"]:
-    #                 if tag["Key"] == "Name":
-    #                     if "public" in tag["Value"]:
-    #                         subnet_id = subnet["SubnetId"]
-    #                         break
-    #         if subnet_id != None:
-    #             break
+        self.logger.debug("Provisioned Product exists: %s", provisioned_product_name)
+        return True
 
-    #     if subnet_id is None:
-    #         self.logger.info("No public subnet in VPC %s. Exiting!", vpc_id)
-    #         raise VPCNotFound
+    def deprovision_scanner(self,provisioned_product_name):
+        """Deprovision a container scanner"""
+        self.logger.info("Deprovisioning container scanner")
 
-    #     self.logger.debug("VPC ID: %s", vpc_id)
-    #     self.logger.debug("Subnet Id: %s", subnet_id)
+        # Terminate VulnScanner Service Catalog Product from AWS account
+        try:
+            client = boto3.client("servicecatalog")
+            response = client.terminate_provisioned_product(
+                ProvisionedProductName=provisioned_product_name
+            )
 
-    #     return subnet_id
+            self.logger.info("container SC product terminated!")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                self.logger.info("ContainerScanner do not exist! No need to deprovision!")
+            else:
+                self.logger.error("Error in deleting the ContainerScanner SC product from AWS account")
+                self.logger.error(e.response["Error"]["Message"])
 
-    # def provision_ec2(self, provisioned_product_name, product_id, provisioning_artifact_id, vpc_id, subnet_id, script):
-    #     # Provision VulnScanner Service Catalog Product
+        #wait for deprovisioning to complete
+        for setup_count in range(15):
+            if not self.provisioned_product_exists(provisioned_product_name):
+                self.logger.info("container SC product successfully removed!")
+                return
+            time.sleep(60)
+           
+        self.logger.error("Deprovisioning timed out")        
+        raise DeprovisioningScannerTimeoutError      
+        
+    def provision_scanner(self, vpc_id, subnet_id, provisioned_product_name):
+        """Provision a Prisma scanner, using Service Catalog product EC2"""
+        self.logger.info("Provisioning container scanner")       
+        
+        # GetProductId
+        response = self.client.search_products(Filters={"FullTextSearch": ["EC2"]})
+        product_id = response["ProductViewSummaries"][0]["ProductId"]
+              
+        # Get other product details
+        response = self.client.describe_product(Id=product_id)
+        
+        SC_EC2_VERSION = "2.0.2"
+        for provision_artifact in response["ProvisioningArtifacts"]:
+            if provision_artifact["Name"] == SC_EC2_VERSION:
+                provisioning_artifact_id = provision_artifact["Id"]        
 
-    #     response = self.sc_client.provision_product(
-    #         ProductId=product_id,
-    #         ProvisionedProductName=provisioned_product_name,
-    #         ProvisioningArtifactId=provisioning_artifact_id,
-    #         Tags=[{"Key": "doNotShutDown", "Value": "true"}],
-    #         ProvisioningParameters=[
-    #             {"Key": "VPCSubnetId", "Value": subnet_id},
-    #             {"Key": "VPCId", "Value": vpc_id},
-    #             {"Key": "CustomUserData", "Value": script},
-    #             # {"Key": "InstanceType", "Value": "t2.large"},
-    #             # TODO(lmcdade): Where does 'linking_key' below originate. Is it necessary?
-    #             # {"Key": "TenableAPIKey", "Value": linking_key},
-    #             # {"Key": "CustomIAMRoleNameSuffix", "Value": ROLE_NAME_SUFFIX},
-    #             {"Key": "AMIImageId", "Value": AMI_IMAGE_ID}
-    #         ],
-    #     )
+        response = self.client.provision_product(
+            ProductId=product_id,
+            # PathName="Compute",
+            ProvisionedProductName=provisioned_product_name,
+            ProvisioningArtifactId=provisioning_artifact_id,
+            Tags=[{"Key": "doNotShutDown", "Value": "true"}],
+            ProvisioningParameters=[
+                    {"Key": "VPCSubnetId", "Value": subnet_id},
+                    # {"Key": "CustomIAMRoleNameSuffix", "Value": "ec2defender"},
+                    # {"Key": "NameTag", "Value": provisioned_product_name},
+                    {"Key": "EC2TagName", "Value": "ContainerScanner"},
+                    {"Key": "InstanceType", "Value": "t2.large"},
+                    {"Key": "AMIImageId", "Value": "/GoldenAMI/gd-amzn2-eks-1-17/latest"},
+                    {"Key": "CustomUserData", "Value": "PRISMASECRET=$(aws secretsmanager get-secret-value --region us-east-1 --secret-id \"PrismaAccessKeys\" --version-stage AWSCURRENT | jq --raw-output .SecretString);ACCESSKEYID=$(echo $PRISMASECRET | jq -r .\"prismaAccessKeyId\");SECRETKEY=$(echo $PRISMASECRET | jq -r .\"prismaSecretKey\");curl -sSL -k -u $ACCESSKEYID:$SECRETKEY -X POST https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/scripts/defender.sh  | sudo bash -s -- -c \"us-east1.cloud.twistlock.com\" -d \"none\";"},
+                ],
+        )
 
-    #     provisioned_product_id = response["RecordDetail"]["ProvisionedProductId"]
-    #     self.logger.info("Provisioned Product ID: %s", provisioned_product_id)
+        provisioned_product_id = response["RecordDetail"]["ProvisionedProductId"]
+        self.logger.info("Provisioned Product ID: %s", provisioned_product_id)
 
-    #     return provisioned_product_id
+        # Wait for product to be provisioned
+        for setup_count in range(15):
+            response = self.client.describe_provisioned_product(Id=provisioned_product_id)
+            if response["ProvisionedProductDetail"]["Status"] == "AVAILABLE":
+                self.logger.info("Container Scanner successfully provisioned")
+                break
+        
+            time.sleep(2*60)
+        else:
+            self.logger.error("Provisioning timed out")
+            self.logger.error(response)       
+        return provisioned_product_name
 
-    # def describe_provisioned_product(self, provisioned_product_id):
-    #     return self.client.describe_provisioned_product(Id=provisioned_product_id)
 
-
-# class ServiceCatalog():
-#     def __init__(self, logger):
-#         self.logger = logger
-#         self.client = boto3.client('servicecatalog')
-
-#     def terminate_provisioned_product(self, provisioned_product_name):
-#         # Terminate VulnScanner Service Catalog Product from AWS account
-#         try:
-#             response = self.client.terminate_provisioned_product(
-#                 ProvisionedProductName=provisioned_product_name
-#             )
-
-#             self.logger.info("VulnScanner SC product successfully deleted!")
-
-#         except ClientError as e:
-#             if e.response["Error"]["Code"] == "ResourceNotFoundException":
-#                 self.logger.info(
-#                     "VulnScanner do not exist! No need to deprovision!")
-#             else:
-#                 self.logger.error(
-#                     "Error in deleting the VulnScanner SC product from AWS account")
-#                 self.logger.error(e.response["Error"]["Message"])
+    def describe_provisioned_product(self, provisioned_product_id):
+        return self.client.describe_provisioned_product(Id=provisioned_product_id)

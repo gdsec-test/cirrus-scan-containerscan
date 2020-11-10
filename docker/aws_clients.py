@@ -245,9 +245,8 @@ class ServiceCatalog():
         self.logger.info("Deprovisioning container scanner")
 
         # Terminate VulnScanner Service Catalog Product from AWS account
-        try:
-            client = boto3.client("servicecatalog")
-            response = client.terminate_provisioned_product(
+        try:            
+            response = self.client.terminate_provisioned_product(
                 ProvisionedProductName=provisioned_product_name
             )
 

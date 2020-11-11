@@ -295,7 +295,7 @@ class ServiceCatalog():
                     # {"Key": "CustomIAMRoleNameSuffix", "Value": "ec2defender"},
                     # {"Key": "NameTag", "Value": provisioned_product_name},
                     {"Key": "EC2TagName", "Value": "ContainerScanner"},
-                    {"Key": "InstanceType", "Value": "t2.large"},
+                    {"Key": "InstanceType", "Value": "t2.xlarge"},
                     {"Key": "AMIImageId", "Value": "/GoldenAMI/gd-amzn2-eks-1-17/latest"},
                     {"Key": "CustomUserData", "Value": "PRISMASECRET=$(aws secretsmanager get-secret-value --region us-east-1 --secret-id \"PrismaAccessKeys\" --version-stage AWSCURRENT | jq --raw-output .SecretString);ACCESSKEYID=$(echo $PRISMASECRET | jq -r .\"prismaAccessKeyId\");SECRETKEY=$(echo $PRISMASECRET | jq -r .\"prismaSecretKey\");curl -sSL -k -u $ACCESSKEYID:$SECRETKEY -X POST https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/scripts/defender.sh  | sudo bash -s -- -c \"us-east1.cloud.twistlock.com\" -d \"none\";"},
                 ],

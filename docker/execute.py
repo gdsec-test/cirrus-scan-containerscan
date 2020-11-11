@@ -50,14 +50,14 @@ def main():
     region = boto3.session.Session().region_name
     logger.debug("region: %s", region)
 
+    s3_client = S3Client(logger)
+    sc_client = ServiceCatalog(logger)
     sts_client = SecurityTokenServiceClient(logger)
     sm_client = SecretsManagerClient(logger)
     ssm_client = SSMClient(logger)
     ecr_client = ECRClient(logger)
     ec2_client = EC2Client(logger)
-    s3_client = S3Client(logger)
-    sc_client = ServiceCatalog(logger)
-    
+     
     
     audit_role_arn = get_audit_role_arn(ssm_client)
     # vpc_id = wrapper.get_parameters()["vpc_id"]  
@@ -67,6 +67,9 @@ def main():
     task_name = f"/CirrusScan/containerscan/{vpc_id}/{task_uuid}"
     provisioned_product_name = f"ContainerScanner-{vpc_id}"
 
+    prisma_client = PrismaClient(logger, sts_client, sm_client, ec2_client)
+    prisma_scanner = Scanner(logger, s3_client,sc_client,ssm_client,provisioned_product_name, task_name)
+       
     isProvisioned = ssm_client.has_task_parameter(task_name)
     logger.debug("isProvisioned: %s", isProvisioned)
 
@@ -79,9 +82,7 @@ def main():
         # - poll repo scan progress
         # - when complete, get repo scan details, use pagination
         # generate findings for security hub
-        prisma_client = PrismaClient(logger, sts_client, sm_client, ec2_client)
-        prisma_scanner = Scanner(logger, s3_client)
-        
+       
         prisma_token = prisma_client.get_token(audit_role_arn)
         
         account_id = sts_client.get_account_id()
@@ -135,9 +136,9 @@ def main():
                 {"status": "SUCCESS", "compliance": compliance,
                     "finding_data": scan_info}
             )
-        
-        sc_client.deprovision_scanner(provisioned_product_name)
-        ssm_client.delete_task_parameter(task_name)
+
+    return prisma_scanner    
+       
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -147,10 +148,14 @@ if __name__ == "__main__":
     logging.getLogger("botocore").setLevel(logging.WARNING)
     logging.getLogger("boto3").setLevel(logging.INFO)
     logging.getLogger("urllib3").setLevel(logging.CRITICAL)
-
+    prisma_scanner = None
+    
     try:
-        main()
+        prisma_scanner = main()
     except ExitContainerScanner:
         logger.info("Exiting Container scanner!")
     except:
         logger.exception("Error while executing containerscan scanner")
+    finally:
+        if prisma_scanner is not None:
+            prisma_scanner.remove()

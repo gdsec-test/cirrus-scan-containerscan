@@ -9,6 +9,7 @@ from datetime import datetime
 from urllib3 import Retry
 from common import securityhub
 from errors import ExitContainerScanner, RegistrationError, ProvisioningTimeoutError, DeprovisioningScannerTimeoutError
+from aws_clients import SSMClient, SecretsManagerClient, S3Client, ServiceCatalog
 
 
 class PrismaClient():
@@ -19,7 +20,7 @@ class PrismaClient():
         self.sts_client = sts_client
         self.sm_client = sm_client
         self.ec2_client = ec2_client
-
+        
     def get_token(self, iam_role_arn):
         """Retrieves Prisma Access key and secret key id from Secret Manager"""
         
@@ -67,7 +68,8 @@ class PrismaClient():
         payload["hostname"] = scanner_dnsname
 
         self.logger.debug("registry payload : %s" % payload)
-        
+        # self.logger.debug("token : %s" % token)
+
         self.create_prisma_api_request(
             "POST", "/settings/registry", token=token, payload=payload)
 
@@ -156,10 +158,14 @@ class PrismaClient():
         raise ExitContainerScanner
 
 
-class Scanner():
-    def __init__(self, logger, s3_client):
+class Scanner():        
+    def __init__(self, logger, s3_client, sc_client, ssm_client,provisioned_product_name,task_name):
         self.logger = logger
         self.s3_client = s3_client
+        self.sc_client = sc_client
+        self.ssm_client = ssm_client
+        self.provisioned_product_name =provisioned_product_name
+        self.task_name = task_name
 
     def save_scanner_results(self, results):
         """Save scanner results to an S3 bucket."""
@@ -280,3 +286,10 @@ class Scanner():
         finding.LastObservedAt = utcnow
 
         finding.save()
+
+    def remove(self):
+        
+        if(self.sc_client.provisioned_product_exists(self.provisioned_product_name)):
+            self.sc_client.deprovision_scanner(self.provisioned_product_name)
+        if(self.ssm_client.has_task_parameter(self.task_name)):    
+            self.ssm_client.delete_task_parameter(self.task_name)

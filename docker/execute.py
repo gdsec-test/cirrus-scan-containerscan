@@ -18,12 +18,13 @@ def get_audit_role_arn(ssm):
     """Get audit role ARN based on an account bucket"""
     orgType = ssm.get_org_type()
     auditAccount = "672751022979"
-    if  orgType == "pci": 
-        auditAccount= "339078146124"
-    elif orgType == "registry": 
-        auditAccount= "906957162968" 
-     
-    auditRoleArn="arn:aws:iam::"+auditAccount+":role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+    if orgType == "pci":
+        auditAccount = "339078146124"
+    elif orgType == "registry":
+        auditAccount = "906957162968"
+
+    auditRoleArn = "arn:aws:iam::"+auditAccount + \
+        ":role/GD-AuditFramework-SecretsManagerReadOnlyRole"
 
     # accounts_bucket = os.getenv("CIRRUS_SCAN_RESULTS_BUCKET")
 
@@ -44,6 +45,7 @@ def get_audit_role_arn(ssm):
     logger.info("AuditRoleARN: %s", auditRoleArn)
     return auditRoleArn
 
+
 def main():
     """Main entry point for ContainerScanner logic"""
     results = None
@@ -57,19 +59,19 @@ def main():
     ssm_client = SSMClient(logger)
     ecr_client = ECRClient(logger)
     ec2_client = EC2Client(logger)
-     
-    
+
     audit_role_arn = get_audit_role_arn(ssm_client)
-    # vpc_id = wrapper.get_parameters()["vpc_id"]  
+    # vpc_id = wrapper.get_parameters()["vpc_id"]
     vpc_id = ssm_client.get_vpc_id()
-    
+
     task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
     task_name = f"/CirrusScan/containerscan/{vpc_id}/{task_uuid}"
     provisioned_product_name = f"ContainerScanner-{vpc_id}"
 
     prisma_client = PrismaClient(logger, sts_client, sm_client, ec2_client)
-    prisma_scanner = Scanner(logger, s3_client,sc_client,ssm_client,provisioned_product_name, task_name)
-       
+    prisma_scanner = Scanner(logger, s3_client, sc_client,
+                             ssm_client, provisioned_product_name, task_name)
+
     isProvisioned = ssm_client.has_task_parameter(task_name)
     logger.debug("isProvisioned: %s", isProvisioned)
 
@@ -82,23 +84,24 @@ def main():
         # - poll repo scan progress
         # - when complete, get repo scan details, use pagination
         # generate findings for security hub
-       
+
         prisma_token = prisma_client.get_token(audit_role_arn)
-        
+
         account_id = sts_client.get_account_id()
         ecr_registry_name = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
         logger.debug("ecr_registry_name: %s", ecr_registry_name)
         subnet_id = ec2_client.get_subnet_id(vpc_id)
         logger.debug("subnet_id: %s", subnet_id)
         ssm_client.create_task_parameter(task_name)
-        
-        sc_client.provision_scanner(vpc_id, subnet_id, provisioned_product_name)
+
+        sc_client.provision_scanner(
+            vpc_id, subnet_id, provisioned_product_name)
 
         prisma_client.register_ecr_registry(
             prisma_token, ecr_registry_name, vpc_id)
 
         prisma_client.force_ecr_registry_scan(prisma_token, ecr_registry_name)
-        
+
         prisma_client.wait_for_scan_completion()
 
         results = prisma_client.retrieve_scanner_results(
@@ -117,7 +120,7 @@ def main():
 
             if results is not None:
                 prisma_scanner.evaluate_scanner_results(
-                    vpc_id, security_hub_mgr, results)
+                    security_hub_mgr, results)
 
             prisma_scanner.generate_informational_finding(security_hub_mgr)
             security_hub_mgr.end_transaction(
@@ -137,8 +140,8 @@ def main():
                     "finding_data": scan_info}
             )
 
-    return prisma_scanner    
-       
+    return prisma_scanner
+
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -149,7 +152,7 @@ if __name__ == "__main__":
     logging.getLogger("boto3").setLevel(logging.INFO)
     logging.getLogger("urllib3").setLevel(logging.CRITICAL)
     prisma_scanner = None
-    
+
     try:
         prisma_scanner = main()
     except ExitContainerScanner:

@@ -20,10 +20,10 @@ class PrismaClient():
         self.sts_client = sts_client
         self.sm_client = sm_client
         self.ec2_client = ec2_client
-        
+
     def get_token(self, iam_role_arn):
         """Retrieves Prisma Access key and secret key id from Secret Manager"""
-        
+
         aws_creds = self.sts_client.assume_role(iam_role_arn)
         prisma_secrets = self.sm_client.get_prisma_secrets(aws_creds)
 
@@ -41,7 +41,7 @@ class PrismaClient():
 
     def register_ecr_registry(self, token, ecr_registry_name, vpc_id):
         """Register ECR registry with Prisma"""
-     
+
         response = self.ec2_client.describe_instances(vpc_id)
 
         region = boto3.session.Session().region_name
@@ -77,18 +77,18 @@ class PrismaClient():
             f"Registered {scanner_dnsname} with ECR registry {ecr_registry_name}!")
 
     def force_ecr_registry_scan(self, token, ecr_registry_name):
-        
+
         payload_template = '{ "tag" : { "registry" : "" } }'
         payload = json.loads(payload_template)
         payload["tag"]["registry"] = ecr_registry_name
-      
+
         response = self.create_prisma_api_request(
             "POST", "/registry/scan", token=token, payload=payload)
 
         self.logger.info(f"Forced scan of ECR registry {ecr_registry_name}!")
 
     def retrieve_scanner_results(self, token, ecr_registry_name):
-        
+
         param = "registry=" + ecr_registry_name
 
         # all results in csv format
@@ -104,7 +104,7 @@ class PrismaClient():
 
         self.logger.info("Waiting for Container Scan to finish")
         # sleep for ?? minutes due to lack of progress api
-        #TODO change to 30
+        # TODO change to 30
         sleep(30*60)
 
     def create_prisma_api_request(self, method, url, token=None, payload=None, params=None):
@@ -135,12 +135,12 @@ class PrismaClient():
             session.mount("https://", adapter)
 
             session.headers = headers
-            fullurl = PRISMA_COMPUTE_REST_API_URL + url   
-         
+            fullurl = PRISMA_COMPUTE_REST_API_URL + url
+
             if method == "POST":
                 response = session.post(
                     fullurl, params=params, data=payload, timeout=5.0)
-            else:                
+            else:
                 response = session.get(
                     fullurl, params=params, data=payload, timeout=5.0)
 
@@ -158,13 +158,13 @@ class PrismaClient():
         raise ExitContainerScanner
 
 
-class Scanner():        
-    def __init__(self, logger, s3_client, sc_client, ssm_client,provisioned_product_name,task_name):
+class Scanner():
+    def __init__(self, logger, s3_client, sc_client, ssm_client, provisioned_product_name, task_name):
         self.logger = logger
         self.s3_client = s3_client
         self.sc_client = sc_client
         self.ssm_client = ssm_client
-        self.provisioned_product_name =provisioned_product_name
+        self.provisioned_product_name = provisioned_product_name
         self.task_name = task_name
 
     def save_scanner_results(self, results):
@@ -174,11 +174,11 @@ class Scanner():
         results_bucket = os.getenv("CIRRUS_SCAN_RESULTS_BUCKET")
         task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
         results_key = "containerscan/%s/results.csv" % task_uuid
-        
+
         temp_csv = "/tmp/results.csv"
         container_results_csv = open(temp_csv, "w")
         csv_writer = csv.writer(container_results_csv)
-        
+
         with StringIO(results) as input_file:
             csv_reader = csv.reader(input_file, delimiter=",", quotechar='"')
             for row in csv_reader:
@@ -192,80 +192,162 @@ class Scanner():
         if os.path.isfile(temp_csv):
             os.remove(temp_csv)
 
-    def evaluate_scanner_results(self, vpc_id, handle, csv_results):
-        """Evaluate scanner results and generate Security Hub findings."""
+    def evaluate_scanner_results(self, handle, csv_results):
+        """Evaluate scanner results and generate Security Hub findings.
+
+        Two things will happen
+        1. Convert CSV Result from Prisma to easily consumable format.
+
+        ```
+        prisma_results = {
+            "<repository_name>" : {
+                "<tag>": {
+                    "<package_1>": [row_resource, row_resource, row_resource, ...],
+                    "<package_2>": [row_resource, row_resource, row_resource, ...],
+                    ...
+                    "gd_prisma_compliance": [row_resource, row_resource, ...]
+                },
+                ...
+            },
+            ...
+        }
+        ```
+
+        2. Create corresponding ASFF payload object and publish.
+        """
         self.logger.info("Evaluating Prisma scanner results")
 
-        csv_results = csv.DictReader(csv_results.split("\r\n"), delimiter=",")
+        prisma_results = {}  # Logical grouping of csv interpretation
+        gd_compliance_type = "gd_prisma_compliance"
+        aws_region = handle.aws_region()
+
+        csv_results = csv.DictReader(csv_results.splitlines(), delimiter=",")
 
         for result in csv_results:
-            if result["Risk"] in ("Low", "Medium", "High"):
-                severity = result.get("Risk", "NONE")
-                title = result.get("Name", "UNKNOWN")
-                description = result.get("Synopsis", "")
-                solution = result.get("Solution", "")
-                url = result.get("See Also", "None").split("\n")[0]
-                host = result.get("Host", "")
+            severity = result.get("Severity", "NONE").capitalize()
 
-                title_id = title.replace(" ", "-")
+            if severity == "None":
+                self.logger.warn(
+                    "Unexpected : Row with no Severity found - Skipping.")
+                continue
 
-                # Generate a SecurityHub finding
-                overrides = {}
-                overrides["Id"] = "vulnscan/%s/%s/%s/%s" % (
-                    handle.aws_region(),
-                    vpc_id,
-                    host,
-                    title_id,
-                )
-                overrides["Title"] = "Vulnerability Scan [%s, %s]" % (
-                    handle.aws_region(),
-                    title,
-                )
-                overrides["Description"] = (
-                    "The Prisma scanner detected an issue (%s)" % description
-                )
-                overrides["Remediation"] = {
-                    "Recommendation": {"Text": solution}}
-                overrides["Resources"] = [
-                    {"Type": "AwsEc2Instance", "Id": host,
-                        "Region": handle.aws_region()}
-                ]
+            # Only process High/Critical finding
+            if severity not in set({"High", "Critical"}):
+                continue
 
-                overrides["GeneratorId"] = "Vulnerability Scan"
-                overrides["Compliance"] = {"Status": "FAILED"}
+            repository_name = result["Repository"]
+            repository_id = result["Id"]
+            tag = result["Tag"]
 
-                if url != "":
-                    overrides["SourceUrl"] = url
+            if not prisma_results.get(repository_name):
+                prisma_results[repository_name] = {}
 
-                if severity == "High":
-                    overrides["Severity"] = securityhub.set_severity(
-                        75, original=severity
-                    )
-                elif severity == "Medium":
-                    overrides["Severity"] = securityhub.set_severity(
-                        50, original=severity
-                    )
-                elif severity == "Low":
-                    overrides["Severity"] = securityhub.set_severity(
-                        25, original=severity
-                    )
-                try:
-                    finding = handle.Finding(
-                        overrides["Id"], override_dict=overrides)
-                    finding.save()
-                except Exception:
-                    self.logger.exception(
-                        "Error while processing scanner result:")
+            if not prisma_results[repository_name].get(tag):
+                prisma_results[repository_name][tag] = {}
+
+            container_map = prisma_results[repository_name][tag]
+
+            row_resource = {
+                "CVSS": result.get("CVSS"),
+                "Description": result.get("Description"),
+                "Id": repository_id,
+                "Severity": severity,
+                "Vulnerability ID": result.get("Vulnerability ID"),
+                "Vulnerability Type": result.get("Type"),
+            }
+
+            if result.get("CVE ID"):
+                row_resource["CVE ID"] = result.get("CVE ID")
+                row_resource["Package Version"] = result.get(
+                    "Package Version"),
+                row_resource["Fix Status"] = result.get("Fix Status"),
+                row_resource["Problem"] = result.get(
+                    "Source Package") or result.get("Packages")
+            else:
+                row_resource["Problem"] = gd_compliance_type
+
+            if not container_map.get(row_resource["Problem"]):
+                container_map[row_resource["Problem"]] = []
+
+            container_map[row_resource["Problem"]].append(row_resource)
+
+        self.logger.info("Finished reading csv file, generating findings...")
+
+        for repository, tag_map in prisma_results.items():
+            for tag, problem_map in tag_map.items():
+                for problem, resources in problem_map.items():
+                    repo_id = None
+                    severity = "High"
+                    resource_dict = {}
+
+                    if problem == gd_compliance_type:
+                        for r in resources:
+                            if r['Severity'] == 'Critical':
+                                severity = r['Severity']
+
+                            if repo_id is None:
+                                repo_id = r['Id']
+
+                            res_id = f"Compliance-{r['Vulnerability ID']}"
+                            details = f"Vulnerability Type: {r['Vulnerability Type']}\r\n Description: {r['Description']}"
+                            resource_dict[res_id] = details
+                    else:
+                        for r in resources:
+                            if r['Severity'] == 'Critical':
+                                severity = r['Severity']
+
+                            if repo_id is None:
+                                repo_id = r['Id']
+
+                            details = f"Problem: {problem}\r\n Package Version: {r['Package Version']}\r\n Fix Status: {r['Fix Status']}\r\n URL: https://nvd.nist.gov/vuln/detail/{r['CVE ID']}"
+                            resource_dict[r['CVE ID']] = details
+
+                    asff_payload = {
+                        "Id": f"containerscan/{aws_region}/{repository}/{tag}/{problem}",
+                        "Title": f"Container Scan [{aws_region}]: Vulnerability found with {problem} in {repository}:{tag}",
+                        "Description": f"One or more vulnerabilities were found with {repository}:{tag} in {aws_region}.",
+                        "Remediation": {
+                            "Recommendation": {
+                                "Text": "Please resolve vulnerabilities found with in ECR, take a look at Resources section within the finding for more details."
+                            }
+                        },
+                        "GeneratorId": "Container Scan",
+                        "Resources": [
+                            {
+                                "Type": "Container",
+                                "Id": repo_id,
+                                "Region": aws_region
+                            },
+                            {
+                                "Type": "Other",
+                                "Id": problem,
+                                "Region": aws_region,
+                                "Details": {
+                                    "Other": resource_dict
+                                }
+                            }
+                        ],
+                        # TODO : Comeback and modify severity normalization.
+                        "Severity": securityhub.set_severity(0, original=severity)
+                    }
+
+                    try:
+                        finding = handle.Finding(
+                            asff_payload["Id"], override_dict=asff_payload)
+                        finding.save()
+                    except Exception:
+                        self.logger.exception(
+                            "Error while processing scanner result:")
 
     def generate_informational_finding(self, handle):
         """Generate an informational finding indicating test is complete"""
 
         self.logger.debug("Test complete")
         utcnow = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        aws_region = handle.aws_region()
 
         # Generate a Security Hub finding
-        finding_id = "vulnscan/complete/%s/%s" % (
-            handle.aws_region(), "SOME_VPC_MOCK")
+        finding_id = f"containerscan/complete/{aws_region}"
         finding = handle.Finding(finding_id)
 
         finding.ProductFields["Environment"] = os.getenv(
@@ -275,21 +357,21 @@ class Scanner():
         finding.ProductFields["TeamName"] = os.getenv(
             "CIRRUS_SCAN_ACCOUNT_TEAM_NAME", "UNKNOWN")
 
-        finding.Title = "Vulnscan: [%s, %s] finished at %s" % (
-            handle.aws_region(),
-            "SOME_VPC_MOCK",
-            utcnow,
-        )
+        finding.Title = f"Container Scan [{aws_region}]: finished at {utcnow}"
         finding.Compliance = {"Status": "PASSED"}
         finding.Description = "No description available."
-        finding.GeneratorId = "Vulnscan"
+        finding.GeneratorId = "Container Scan"
         finding.LastObservedAt = utcnow
 
-        finding.save()
+        try:
+            finding.save()
+        except Exception:
+            self.logger.exception(
+                "Error while processing scanner completed result:")
 
     def remove(self):
-        
+
         if(self.sc_client.provisioned_product_exists(self.provisioned_product_name)):
             self.sc_client.deprovision_scanner(self.provisioned_product_name)
-        if(self.ssm_client.has_task_parameter(self.task_name)):    
+        if(self.ssm_client.has_task_parameter(self.task_name)):
             self.ssm_client.delete_task_parameter(self.task_name)

@@ -12,7 +12,7 @@ performed at container build time.
 
 # Prisma Cloud Container Defender
 
-Prisma is Godaddy's chosen vendor for performing container image compliance and vulnerability scans in the cloud. Prisma Cloud allows admin users to configure compliance and vulnerabilitiy policy and rules used by different scan processes either through the admin console, or through APIs. 
+Prisma is Godaddy's chosen vendor for performing container image compliance and vulnerability scans in the cloud. Prisma Cloud allows admin users to configure compliance and vulnerabilitiy policy and rules used by different scan processes either through the admin console, or through APIs.
 
 Prisma Cloud Container Defender covers compliance and vulnerability scans for images in ECR registries by enforcing policy rules configured in Prisma admin console.
 
@@ -42,7 +42,7 @@ When a container scan is requested, the following activities take place:
 To find debugging logs from the container, go to Cloudwatch logs, and
 filter logs by **/ecs/containerscan**. You should see the debugging logs from the
 containerscan container in the most recent log stream. Please verify the last event time.
-  
+
 ## Security Findings
 
 By design, all containerscan findings are created with severity **HIGH** or **CRITICAL**.
@@ -51,5 +51,18 @@ Security Hub:
 
 * Record State _EQUALS_ ACTIVE
 * ID _PREFIX_ containerscan/
-  
+
 For any further assistance, please reach out to DL-AppSecurity@godaddy.com.
+
+## Development
+
+### Environment Setup
+
+```bash
+$ python3 -m venv .venv
+$ source .venv/bin/activate # Activate virtualenv
+(.venv) $ pip install --upgrade pip
+(.venv) $ pip install -r requirements.txt
+(.venv) $ pre-commit install --install-hooks
+(.venv) $ deactivate # if desired
+```

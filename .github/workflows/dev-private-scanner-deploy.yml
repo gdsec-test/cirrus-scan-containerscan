@@ -1,0 +1,41 @@
+name: Dev-Private Container Scanner Deploy
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  containerscanner-deploy:
+    runs-on: self-hosted
+    steps:
+    - name: Checkout this repo on to a job runner.
+      uses: actions/checkout@01aeccc # Checkout this repository.
+
+    - name: Checkout GoDaddy Actions repo # Checkout shared actions repository gd-actions
+      uses: actions/checkout@01aeccc
+      with:
+        repository: gdcorp-cp/gd-actions
+        token: ${{ secrets.REPO_CLONE_TOKEN }} # PAT with read access to gdcorp-cp/gd-actions
+        path: gd-actions # Relative to github working directory
+        persist-credentials: false
+
+    - name: Configure AWS credentials using custom aws-okta-authenticate action for existing Jomax Service Accounts
+      uses: ./gd-actions/aws-okta-authenticate
+      with:
+        aws-okta-user: ${{ secrets.AWS_DEV_PRIVATE_JOMAX_USER }}
+        aws-okta-pass: ${{ secrets.AWS_DEV_PRIVATE_JOMAX_PASS }}
+        aws-okta-role: ${{ secrets.AWS_DEV_PRIVATE_DEPLOY_ROLE_ARN }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@337a919
+
+    - name: Build, tag, and push docker image to Amazon ECR
+      working-directory: docker
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: containerscan
+        IMAGE_TAG: latest
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG

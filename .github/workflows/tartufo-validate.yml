@@ -1,0 +1,30 @@
+
+name: Tartufo Validate Workflow.
+
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+    branches:
+      - '*'
+
+jobs:
+  tartufo-job:
+    runs-on: ubuntu-latest # Linux runner
+    steps:
+    - name: Checkout this repo on to a job runner.
+      uses: actions/checkout@c952173 # Checkout this repository https://github.com/actions/checkout/commits/main
+
+    - name: Checkout GoDaddy Actions repo # Checkout shared actions repository gd-actions
+      uses: actions/checkout@c952173
+      with:
+        repository: gdcorp-cp/gd-actions
+        token: ${{ secrets.REPO_CLONE_TOKEN }} # PAT with read access to gdcorp-cp/gd-actions
+        path: gd-actions # Relative to github working directory
+        persist-credentials: false
+
+    - name: Run tartufo against current commit hash.
+      uses: ./gd-actions/tartufo # Relative reference to action in gd-actions repository
+      with:
+        github_token: ${{ secrets.REPO_CLONE_TOKEN }}

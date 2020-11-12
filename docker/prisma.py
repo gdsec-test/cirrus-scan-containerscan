@@ -42,6 +42,11 @@ class PrismaClient():
     def register_ecr_registry(self, token, ecr_registry_name, vpc_id):
         """Register ECR registry with Prisma"""
 
+
+         # Force sleep to ensure defender is known to console
+        self.logger("register_ecr_registry sleeps for 5 minutes before register %s" % ecr_registry_name")
+        sleep(5*60)
+       
         response = self.ec2_client.describe_instances(vpc_id)
 
         region = boto3.session.Session().region_name
@@ -66,9 +71,7 @@ class PrismaClient():
         payload = json.loads(payload_template)
         payload["registry"] = ecr_registry_name
         payload["hostname"] = scanner_dnsname
-
-        self.logger.debug("registry payload : %s" % payload)
-        # self.logger.debug("token : %s" % token)
+      
 
         self.create_prisma_api_request(
             "POST", "/settings/registry", token=token, payload=payload)
@@ -103,8 +106,7 @@ class PrismaClient():
         """Wait for the scan to be completed"""
 
         self.logger.info("Waiting for Container Scan to finish")
-        # sleep for ?? minutes due to lack of progress api
-        # TODO change to 30
+        # sleep for ?? minutes due to lack of progress api       
         sleep(30*60)
 
     def create_prisma_api_request(self, method, url, token=None, payload=None, params=None):
@@ -114,7 +116,10 @@ class PrismaClient():
         response = None
         payload = json.dumps(payload)
 
-        # As we may hit Prisma API limits, try hitting Prisma at least 3 times before shutting down Vulnerability Scanner
+        if payload is not None and "username" not in payload:
+            self.logger.debug("url %s |method: %s  |payload : %s" % (url , method , payload))
+        
+        # As we may hit Prisma API limits, try hitting Prisma at least 3 times before shutting down Container Scanner
         retries = Retry(
             total=3,
             status_forcelist={429, 501, 502, 503, 504},

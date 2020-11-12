@@ -75,7 +75,7 @@ def main():
     isProvisioned = ssm_client.has_task_parameter(task_name)
     logger.debug("isProvisioned: %s", isProvisioned)
 
-    sendToSecurityHub = False
+    sendToSecurityHub = True
 
     if not isProvisioned and ecr_client.has_repositories(region):
         # launch EC2 through service catalog with user data
@@ -160,5 +160,5 @@ if __name__ == "__main__":
     except:
         logger.exception("Error while executing containerscan scanner")
     finally:
-        if prisma_scanner is not None:
+        if prisma_scanner is not None:            
             prisma_scanner.remove()

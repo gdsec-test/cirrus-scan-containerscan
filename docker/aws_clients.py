@@ -78,7 +78,7 @@ class SecretsManagerClient():
             raise SecretManagerRetrievalError
 
         self.logger.info(
-            "Successfully fetched an Prisma Secrets from Secrets Manager.")
+            "Successfully fetched Prisma Secrets from Secrets Manager.")
         return secret
 
 
@@ -196,7 +196,7 @@ class EC2Client():
     def describe_instances(self, vpc_id):
         return self.client.describe_instances(
             Filters=[
-                {"Name": "tag:Name", "Values": ["ContainerScanner"]},
+                {"Name": "tag:Name", "Values": ["ContainerECRScanner"]},
                 {"Name": "instance-state-name", "Values": ["running"]},
                 {"Name": "vpc-id", "Values": [vpc_id]},
             ])    
@@ -269,19 +269,19 @@ class ServiceCatalog():
         raise DeprovisioningScannerTimeoutError      
         
     def provision_scanner(self, vpc_id, subnet_id, provisioned_product_name):
-        """Provision a Prisma scanner, using Service Catalog product EC2"""
+        """Provision a Prisma scanner, using Service Catalog product ContainerScanner"""
         self.logger.info("Provisioning container scanner")       
         
         # GetProductId
-        response = self.client.search_products(Filters={"FullTextSearch": ["EC2"]})
+        response = self.client.search_products(Filters={"FullTextSearch": ["ContainerScanner"]})
         product_id = response["ProductViewSummaries"][0]["ProductId"]
               
         # Get other product details
         response = self.client.describe_product(Id=product_id)
         
-        SC_EC2_VERSION = "2.0.2"
+        SC_PRODUCT_VERSION = "1.0.0"
         for provision_artifact in response["ProvisioningArtifacts"]:
-            if provision_artifact["Name"] == SC_EC2_VERSION:
+            if provision_artifact["Name"] == SC_PRODUCT_VERSION:
                 provisioning_artifact_id = provision_artifact["Id"]        
 
         response = self.client.provision_product(
@@ -291,13 +291,13 @@ class ServiceCatalog():
             ProvisioningArtifactId=provisioning_artifact_id,
             Tags=[{"Key": "doNotShutDown", "Value": "true"}],
             ProvisioningParameters=[
-                    {"Key": "VPCSubnetId", "Value": subnet_id},
-                    # {"Key": "CustomIAMRoleNameSuffix", "Value": "ec2defender"},
-                    # {"Key": "NameTag", "Value": provisioned_product_name},
-                    {"Key": "EC2TagName", "Value": "ContainerScanner"},
-                    {"Key": "InstanceType", "Value": "t2.xlarge"},
-                    {"Key": "AMIImageId", "Value": "/GoldenAMI/gd-amzn2-eks-1-17/latest"},
-                    {"Key": "CustomUserData", "Value": "PRISMASECRET=$(aws secretsmanager get-secret-value --region us-east-1 --secret-id \"PrismaAccessKeys\" --version-stage AWSCURRENT | jq --raw-output .SecretString);ACCESSKEYID=$(echo $PRISMASECRET | jq -r .\"prismaAccessKeyId\");SECRETKEY=$(echo $PRISMASECRET | jq -r .\"prismaSecretKey\");curl -sSL -k -u $ACCESSKEYID:$SECRETKEY -X POST https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/scripts/defender.sh  | sudo bash -s -- -c \"us-east1.cloud.twistlock.com\" -d \"none\";"},
+                    # {"Key": "VPCSubnetId", "Value": subnet_id},
+                    # # {"Key": "CustomIAMRoleNameSuffix", "Value": "ec2defender"},
+                    # # {"Key": "NameTag", "Value": provisioned_product_name},
+                    # {"Key": "EC2TagName", "Value": "ContainerScanner"},
+                    {"Key": "InstanceType", "Value": "t3.large"},
+                    # {"Key": "AMIImageId", "Value": "/GoldenAMI/gd-amzn2-eks-1-17/latest"},
+                    # {"Key": "CustomUserData", "Value": "PRISMASECRET=$(aws secretsmanager get-secret-value --region us-east-1 --secret-id \"PrismaAccessKeys\" --version-stage AWSCURRENT | jq --raw-output .SecretString);ACCESSKEYID=$(echo $PRISMASECRET | jq -r .\"prismaAccessKeyId\");SECRETKEY=$(echo $PRISMASECRET | jq -r .\"prismaSecretKey\");curl -sSL -k -u $ACCESSKEYID:$SECRETKEY -X POST https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/scripts/defender.sh  | sudo bash -s -- -c \"us-east1.cloud.twistlock.com\" -d \"none\";"},
                 ],
         )
 
@@ -309,9 +309,8 @@ class ServiceCatalog():
             response = self.client.describe_provisioned_product(Id=provisioned_product_id)
             if response["ProvisionedProductDetail"]["Status"] == "AVAILABLE":
                 self.logger.info("Container Scanner successfully provisioned")
-                break
-        
-            time.sleep(2*60)
+                break        
+            time.sleep(1*60)
         else:
             self.logger.error("Provisioning timed out")
             self.logger.error(response)       

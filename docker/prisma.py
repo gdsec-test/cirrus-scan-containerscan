@@ -14,6 +14,8 @@ from aws_clients import SSMClient, SecretsManagerClient, S3Client, ServiceCatalo
 
 class PrismaClient():
     """Prisma client to fetch prisma token """
+    SCAN_WAIT_TIME = 10
+    REGISTERY_MAX_WAIT_TIME=15
 
     def __init__(self, logger, sts_client, sm_client, ec2_client):
         self.logger = logger
@@ -42,17 +44,9 @@ class PrismaClient():
     def register_ecr_registry(self, token, ecr_registry_name, vpc_id):
         """Register ECR registry with Prisma"""
 
-
-         # Force sleep to ensure defender is known to console
-        self.logger("register_ecr_registry sleeps for 5 minutes before register %s" % ecr_registry_name")
-        sleep(5*60)
        
         response = self.ec2_client.describe_instances(vpc_id)
-
-        region = boto3.session.Session().region_name
-        account_id = boto3.client("sts").get_caller_identity().get("Account")
-        scanner_name = "cirrusscan" + "-" + account_id + "-" + region + "-" + vpc_id
-
+     
         try:
             scanner_dnsname = response["Reservations"][0]["Instances"][0]["NetworkInterfaces"][
                 0
@@ -62,8 +56,24 @@ class PrismaClient():
             self.logger.error("Scanner IP not found")
             scanner_dnsname = None
 
+
         if scanner_dnsname is None:
-            raise RegistrationError
+            raise RegistrationError       
+        
+        params ={'hostname':scanner_dnsname}            
+        for setup_count in range(self.REGISTERY_MAX_WAIT_TIME):
+            self.logger.debug("waiting for defender to report to console, loop: %d" % setup_count)
+            sleep(1*60)
+            response = self.create_prisma_api_request("GET", "/defenders/names",token=token,params=params )
+            defenders = json.dumps(response.json())       
+        
+            if scanner_dnsname in defenders:
+                self.logger.info("Defender reported to console, ecr %s | scanner: %s" % (ecr_registry_name, scanner_dnsname))
+                break
+                       
+        #force sleep for defender to get to console
+        # self.logger.info("Force sleep %d minutes for defender to report to console, ecr %s | scanner: %s" % (self.REGISTERY_WAIT_TIME, ecr_registry_name, scanner_dnsname))
+        # sleep(self.REGISTERY_WAIT_TIME*60)
 
         # register ECR registry
         # curl -H "Authorization: Bearer "${TOKEN}"" -X POST -d '{"registry":"226955763576.dkr.ecr.us-west-2.amazonaws.com","repository":"","tag":"","cap":5,"os":"linux","hostname":"","namespace":"","useAWSRole":true,"version":"aws","credential":{"_id":"","type":"","accountID":"","accountGUID":"","secret":{"encrypted":""},"apiToken":{"encrypted":""},"lastModified":"0001-01-01T00:00:00Z","owner":"","tokens":null},"credentialID":"","roleArn":"","scanners":1,"versionPattern":""}' https://us-east1.cloud.twistlock.com/us-2-158254964/api/v1/settings/registry
@@ -105,9 +115,9 @@ class PrismaClient():
     def wait_for_scan_completion(self):
         """Wait for the scan to be completed"""
 
-        self.logger.info("Waiting for Container Scan to finish")
+        self.logger.info("Waiting for {} minutes for Container Scan to finish".format(self.SCAN_WAIT_TIME))
         # sleep for ?? minutes due to lack of progress api       
-        sleep(30*60)
+        sleep(self.SCAN_WAIT_TIME*60)
 
     def create_prisma_api_request(self, method, url, token=None, payload=None, params=None):
         """Helper function to make Prisma API requests"""
@@ -117,7 +127,9 @@ class PrismaClient():
         payload = json.dumps(payload)
 
         if payload is not None and "username" not in payload:
-            self.logger.debug("url %s |method: %s  |payload : %s" % (url , method , payload))
+            self.logger.debug("url: %s |method: %s  |payload : %s" % (url , method , payload))
+        if params is not None:
+            self.logger.debug("params: %s" % params )
         
         # As we may hit Prisma API limits, try hitting Prisma at least 3 times before shutting down Container Scanner
         retries = Retry(

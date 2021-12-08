@@ -1,0 +1,37 @@
+[tool.tartufo]
+cleanup = true
+entropy = true
+exclude-paths = ".tartufo-excludes"
+exclude-signatures = [
+    "4817bbccd189d913e7e51f42e3b90f74fdccf7074e165f7650a7556c721cfbbe",
+    "314454ce1ad794a9760fb7274eda947655af072dff77f698eb96f3fbf77792ac"
+]
+json = false
+regex = true
+repo-path = "."
+
+[tool.pytest.ini_options]
+addopts = "--cov"
+testpaths = [
+    "tests",
+]
+
+[tool.black]
+exclude = '''
+(
+  /(
+      \.eggs         # exclude a few common directories in the
+    | \.git          # root of the project
+    | \.hg
+    | \.mypy_cache
+    | \.tox
+    | \.venv
+    | _build
+    | buck-out
+    | build
+    | dist
+  )/
+  | config
+  | common
+)
+'''

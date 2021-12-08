@@ -1,115 +1,188 @@
 #!/usr/bin/env python3
 
 import datetime
-import json
 import logging
 import os
 import boto3
-
-import common.securityhub
 import wrapper
+from common import securityhub
+from aws_clients import (
+    SecurityTokenServiceClient,
+    EC2Client,
+    ECRClient,
+    SSMClient,
+    SecretsManagerClient,
+    S3Client,
+    ServiceCatalog,
+)
+from prisma import Scanner, PrismaClient
+from errors import SecretManagerRetrievalError, ExitContainerScanner
 
-log = logging.getLogger(__name__)
-log.setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
-def generate_informational_finding(handle, scope_name):
-    """Generate an informational finding indicating scan is complete"""
+def get_audit_role_arn(ssm):
+    """Get audit role ARN based on an account bucket"""
+    orgType = ssm.get_org_type()
+    auditAccount = "672751022979"
+    if orgType == "pci":
+        auditAccount = "339078146124"
+    elif orgType == "registry":
+        auditAccount = "906957162968"
 
-    log.debug("Scan complete")
-
-    # Generate a Security Hub finding
-    f = handle.Finding("portscan/complete/" + scope_name)
-
-    f.ProductFields["Environment"] = os.getenv(
-        "CIRRUS_SCAN_ACCOUNT_ENVIRONMENT", "UNKNOWN"
+    auditRoleArn = (
+        "arn:aws:iam::"
+        + auditAccount
+        + ":role/GD-AuditFramework-SecretsManagerReadOnlyRole"
     )
-    f.ProductFields["TaskUuid"] = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNKNOWN")
-    f.ProductFields["TeamName"] = os.getenv("CIRRUS_SCAN_ACCOUNT_TEAM_NAME", "UNKNOWN")
 
-    f.Title = "%s portscan: finished scan at %s" % (
-        scope_name,
-        datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-    )
-    f.Compliance = {"Status": "PASSED"}
-    f.Description = "No description available."
-    f.GeneratorId = "portscan"
+    # accounts_bucket = os.getenv("CIRRUS_SCAN_RESULTS_BUCKET")
 
-    f.save()
+    # if not accounts_bucket:
+    #     logger.error("Error in retrieving Global Account bucket details. Exiting!")
+    #     raise SecretManagerRetrievalError
+    # elif "dev-private" in accounts_bucket:
+    #     auditRoleArn = "arn:aws:iam::878238275157:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+    # elif "gd-audit-prod-cirrus-scan-results-p" in accounts_bucket:
+    #     auditRoleArn = "arn:aws:iam::339078146124:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+    # elif "gd-audit-prod-cirrus-scan-results-h" in accounts_bucket:
+    #     auditRoleArn = "arn:aws:iam::512827982966:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+    # elif "gd-audit-prod-cirrus-scan-results-r" in accounts_bucket:
+    #     auditRoleArn = "arn:aws:iam::906957162968:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
+    # elif "gd-audit-prod-cirrus-scan-results" in accounts_bucket:
+    #     auditRoleArn = "arn:aws:iam::672751022979:role/GD-AuditFramework-SecretsManagerReadOnlyRole"
 
-
-def test_compliance(scan_info, max_pass=69):
-    """Returns 'PASS' or 'FAIL'"""
-
-    # We are compliant if no findings exist with severities greater than max_pass
-    # (default 69 - aka LOW and MEDIUM are permissible, but not HIGH or CRITICAL)
-    for severity in scan_info["severity"]:
-        if severity > max_pass:
-            return "FAIL"
-    return "PASS"
+    logger.info("AuditRoleARN: %s", auditRoleArn)
+    return auditRoleArn
 
 
 def main():
-    """Top-Level Scanner Control Flow"""
+    """Main entry point for ContainerScanner logic"""
+    results = None
+    region = boto3.session.Session().region_name
+    logger.debug("region: %s", region)
 
-    # Get parameters from caller
-    parameters = wrapper.get_parameters()
-    scope_name = parameters.get("scope", "default")
-    snow_instance = parameters.get("servicenow_instance", None)
-    source_zone = parameters.get("source", "aws")
-    port_severity = parameters.get("openport_severity", 70)
+    prisma_scanner = None
+    defender_name = None
+    prisma_token = None
+    task_name = None
+    provisioned_product_name = None
 
-    # If the source zone is unrecognized, we can't do anything
-    if source_zone != "aws":
-        log.error("Unrecognized source zone %s", source_zone)
-        wrapper.put_status(
-            {"status": "FAILED", "comment": "Unrecognized source " + source_zone}
+    try:
+        s3_client = S3Client(logger)
+        sc_client = ServiceCatalog(logger)
+        sts_client = SecurityTokenServiceClient(logger)
+        sm_client = SecretsManagerClient(logger)
+        ssm_client = SSMClient(logger)
+        ecr_client = ECRClient(logger)
+        ec2_client = EC2Client(logger)
+
+        audit_role_arn = get_audit_role_arn(ssm_client)
+        vpc_id = wrapper.get_parameters()["vpc_id"]
+
+        task_uuid = os.getenv("CIRRUS_SCAN_TASK_UUID", "UNDEFINED")
+        task_name = f"/CirrusScan/containerscan/{vpc_id}/{task_uuid}"
+        provisioned_product_name = f"ContainerScanner-{vpc_id}"
+
+        prisma_client = PrismaClient(logger, sts_client, sm_client, ec2_client)
+        prisma_scanner = Scanner(
+            logger, s3_client, sc_client, ssm_client, prisma_client
         )
-        return
 
-    # +-------------------------------------------------------+
-    # | TODO: Provision remote scanner if source is not "aws" |
-    # +-------------------------------------------------------+
+        isProvisioned = ssm_client.has_task_parameter(task_name)
+        logger.debug("isProvisioned: %s", isProvisioned)
 
-    # +-------------------------------------------------------+
-    # | TODO: Execute scanner                                 |
-    # +-------------------------------------------------------+
+        has_ecr_repos = ecr_client.has_repositories(region)
+        logger.debug(f"has_ecr_repos: {has_ecr_repos}")
 
-    # +-------------------------------------------------------+
-    # | TODO: Retrieve scanner results                        |
-    # +-------------------------------------------------------+
+        if not isProvisioned and has_ecr_repos:
+            # launch EC2 through service catalog with user data
+            # - register ECR registry in Prisma with hostname
+            # - force repo scan
+            # - poll repo scan progress
+            # - when complete, get repo scan details, use pagination
+            # generate findings for security hub
 
-    # +-------------------------------------------------------+
-    # | TODO: Deprovision remote scanner if provisioned above |
-    # +-------------------------------------------------------+
+            prisma_token = prisma_client.get_token(audit_role_arn)
 
-    # Initialize Security Hub context
-    handle = common.securityhub.SecurityHub_Manager(
-        exception_rules=wrapper.get_exception_rules()
-    )
-    handle.begin_transaction(scope_prefix="portscan/" + scope_name + "/")
+            account_id = sts_client.get_account_id()
+            ecr_registry_name = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
+            logger.debug("ecr_registry_name: %s", ecr_registry_name)
+            subnet_id = ec2_client.get_subnet_id(vpc_id)
 
-    # +-------------------------------------------------------+
-    # | TODO: Create findings for all nonconformances         |
-    # +-------------------------------------------------------+
+            ssm_client.create_task_parameter(task_name)
 
-    # Report scan completion and flush changes to Security Hub
-    generate_informational_finding(handle, scope_name)
-    handle.end_transaction(autoarchive=True)
+            sc_client.provision_scanner(vpc_id, subnet_id, provisioned_product_name)
 
-    # Grab some information about what we found and forward it back
-    # to wrapper so it can be reported. We are compliant if no findings
-    # exist with severities greater than 69. (aka LOW and MEDIUM are
-    # permissible, but not HIGH or CRITICAL -- and high starts at 70.)
-    scan_info = handle.get_finding_data()
-    compliance = test_compliance(scan_info)
-    wrapper.put_status(
-        {"status": "SUCCESS", "compliance": compliance, "finding_data": scan_info}
-    )
+            defender_name = ec2_client.get_defendername(vpc_id)
+
+            prisma_client.register_ecr_registry(
+                prisma_token, ecr_registry_name, defender_name
+            )
+
+            prisma_client.force_ecr_registry_scan(prisma_token, ecr_registry_name)
+
+            prisma_client.wait_for_scan_completion()
+
+            results = prisma_client.retrieve_scanner_results(
+                prisma_token, ecr_registry_name
+            )
+
+            prisma_scanner.save_scanner_results(results)
+
+            sendToSecurityHub = wrapper.get_parameters().get("securityhub", False)
+            logger.debug(f"sendToSecurityHub: {sendToSecurityHub}")
+
+            if sendToSecurityHub:
+                security_hub_mgr = securityhub.SecurityHub_Manager(
+                    exception_rules=wrapper.get_exception_rules()
+                )
+
+                security_hub_mgr.begin_transaction(
+                    scope_prefix="containerscan/" + security_hub_mgr.aws_region(),
+                    scope_region=security_hub_mgr.aws_region(),
+                )
+
+                if results is not None:
+                    prisma_scanner.evaluate_scanner_results(security_hub_mgr, results)
+
+                prisma_scanner.generate_informational_finding(security_hub_mgr)
+                security_hub_mgr.end_transaction(autoarchive=True, dont_archive=None)
+
+                # Pass back finding demographic information. For purposes
+                # of this scanner, any finding with a normalized severity
+                # of at least 70 constitutes a compliance failure.
+                scan_info = security_hub_mgr.get_finding_data()
+                compliance = "PASS"
+                for severity in scan_info["severity"]:
+                    if severity >= 70:
+                        compliance = "FAIL"
+                        break
+                wrapper.put_status(
+                    {
+                        "status": "SUCCESS",
+                        "compliance": compliance,
+                        "finding_data": scan_info,
+                    }
+                )
+            else:
+                logger.info("Skip sending to SecurityHub")
+        else:
+            logger.info("Skip container scanner")
+
+    except ExitContainerScanner:
+        logger.info("Exiting Container scanner with ExitContainerScanner exception")
+    except:
+        logger.exception("Error while executing containerscan scanner")
+    finally:
+        if prisma_scanner is not None:
+            prisma_scanner.remove(
+                provisioned_product_name, task_name, prisma_token, defender_name
+            )
 
 
 if __name__ == "__main__":
-    # Adjust log format and content
     logging.basicConfig(
         level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
     )
@@ -118,5 +191,4 @@ if __name__ == "__main__":
     logging.getLogger("boto3").setLevel(logging.INFO)
     logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-    # Perform the scan
     main()

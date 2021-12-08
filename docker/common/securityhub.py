@@ -218,6 +218,7 @@ class Finding:  # pylint: disable=too-many-instance-attributes
         "ThreatIntelIndicators",
         "Title",
         "UpdatedAt",
+        "Vulnerabilities",
     }
 
     # These fields must be present in order for a finding to be valid (importable).
@@ -700,7 +701,9 @@ class SecurityHub_Manager:  # pylint: disable=too-many-instance-attributes,inval
 
         self._dirty = False
         log.info(
-            "cached %i findings for prefix %s", processed, self._prefix,
+            "cached %i findings for prefix %s",
+            processed,
+            self._prefix,
         )
 
     def _load_one(self, finding_id, account_id=None):

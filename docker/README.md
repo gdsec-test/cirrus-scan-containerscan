@@ -1,47 +1,37 @@
-# Open Port Scan Container
+# Container Scan Container
 
-This container verifies that hosts do not expose unexpected open ports.
+This container verifies that container images in ECR registryies don't have high or critical compliance 
+or vulnerability exposure.
 
-## Configuring the Open Port Scan Scanner
+## Configuring the ContainerScan Scanner
 
-This scanner optionally utilizes data in the `parameter` table to control
-scans. A separate scanner instance is launched for each element in the
-parameter list. Normally the parameter list should contain
-exactly one element.
+This container executes the Prisma Compute defender instance.  It is assumed
+that the current execution role has the policies required to access the various
+AWS resources.  The following AWS Managed Policies can be attached to the
+principal in order to grant necessary permissions:
 
-This element may optionally define the following keys:
+* ServiceCatalog:EndUserFullAccess
+* AssumeRole:GD-AuditFramework-SecretsManagerReadOnlyRole
+* ReadOnlyAccess
+* SecurityAudit
 
-* `source`: The name of the zone where port probes will originate. If the name
-  is unrecognized, *no scan is performed.* The zone name `aws` (the default)
-  means scanning will be performed from the ECS task instance.
+The following AWS Managed Policies is required for Prisma defender to scan a given ECR registry:
+* AmazonEC2ContainerRegistryReadOnly
 
-* `servicenow_instance`: A designator (such as `prod` or `dev`) indicating
-  the ServiceNow instance that should be recorded in findings. By default,
-  no instance is recorded and CirrusScan will communicate with the default
-  ServiceNow instance configured elsewhere.
 
-* `openport_severity`: The normalized severity that will be assigned to findings
-  created because an unexpected open port was detected. The default is `70`.
-
-**FIXME** - more parameters required
-
-Note: Normalized severities fall in the range 0-100 (where `0` is Informational
-and `100` is Critical). A severity outside of this range (such as `-1`) will
-suppress findings of the specified type.
-
-## Deploying the Open Port Scan Scanner
+## Deploying the Container Scan Scanner
 
 ### Build container
 
 ```bash
-sudo docker build --pull -t portscan .
+sudo docker build --pull -t containerscan .
 
 ```
 
 ### Debugging (shell)
 
 ```bash
-sudo docker run --rm -it portscan /bin/bash
+sudo docker run --rm -it containerscan /bin/bash
 
 ```
 
@@ -50,14 +40,14 @@ sudo docker run --rm -it portscan /bin/bash
 #### Create repository on Amazon ECR (Elastic Container Registry)
 
 ```bash
-aws ecr create-repository --repository-name portscan
+aws ecr create-repository --repository-name containerscan
 
 ```
 
 #### Delete repository on Amazon ECR (Elastic Container Registry)
 
 ```bash
-aws ecr delete-repository --repository-name portscan --force
+aws ecr delete-repository --repository-name containerscan --force
 
 ```
 
@@ -68,11 +58,7 @@ You will need to substitute the Amazon ID in the URLs below:
 ```bash
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 sudo $(aws ecr get-login --no-include-email --region us-west-2)
-sudo docker tag portscan:latest ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/portscan:latest
-sudo docker push ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/portscan:latest
+sudo docker tag containerscan:latest ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/containerscan:latest
+sudo docker push ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/containerscan:latest
 
 ```
-
-### Testing
-
-See [test_container.sh](test_container.sh)

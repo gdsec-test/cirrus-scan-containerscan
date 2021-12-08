@@ -1,0 +1,54 @@
+
+name: Build Workflow
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+
+jobs:
+  tartufo-job:
+    runs-on: ubuntu-latest # Linux runner
+    steps:
+    - name: Checkout this repo on to a job runner.
+      uses: actions/checkout@5a4ac90 # Checkout this repository https://github.com/actions/checkout/commits/main
+
+    - name: Checkout GoDaddy Actions repo # Checkout shared actions repository gd-actions
+      uses: actions/checkout@5a4ac90
+      with:
+        repository: gdcorp-cp/gd-actions
+        token: ${{ secrets.REPO_CLONE_TOKEN }} # PAT with read access to gdcorp-cp/gd-actions
+        path: gd-actions # Relative to github working directory
+        persist-credentials: false
+
+    - name: Run tartufo against current commit hash.
+      uses: ./gd-actions/tartufo # Relative reference to action in gd-actions repository
+      with:
+        github_token: ${{ secrets.REPO_CLONE_TOKEN }}
+
+  lint-test-job:
+    needs: tartufo-job
+    runs-on: ubuntu-latest # Linux runner
+    steps:
+    - name: Checkout this repo on to a job runner.
+      uses: actions/checkout@5a4ac90 # Checkout this repository https://github.com/actions/checkout/commits/main
+
+    - name: Set up Python 3.8
+      uses: actions/setup-python@41b7212
+      with:
+        python-version: 3.8
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Lint with pylint
+      run: pylint -E docker tests --ignore=common,wrapper.py
+
+    - name: Static security analysis with Bandit
+      run: bandit -r docker tests -x common,wrapper.py -s B105,B108
+
+    - name: Test with coverage
+      run: pytest --cov-report term-missing --cov-report xml
